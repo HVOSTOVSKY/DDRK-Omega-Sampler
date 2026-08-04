@@ -1,0 +1,14 @@
+Positive: A majestic cyberpunk samurai standing on the edge of a floating neon-lit
+skyscraper at twilight, volumetric fog rolling between buildings,
+holographic koi fish swimming through the air, intricate circuitry
+patterns on the samurai's armor glowing with soft cyan light,
+shallow depth of field, cinematic composition, ultra detailed,
+8k render, dramatic rim lighting, moody atmosphere
+
+Negative: worst quality, low quality, blurry, deformed, mutated, ugly, disfigured, text, error, extra limbs, missing limbs, gross proportions, jpeg artifacts, lowres, low contrast, monochrome, grayscale, flat lighting.
+
+CFG: 5.0
+
+Steps: 20
+
+Scheduler: DDRK_Auto

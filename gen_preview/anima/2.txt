@@ -1,0 +1,12 @@
+Positive: Hyper-realistic portrait of a Mongolian warrior woman with ice-blue eyes,
+intricate silver facial tattoos, fur-lined armor with etched bone details,
+snowy mountain backdrop, soft overcast lighting, skin pores visible,
+shallow depth of field, shot on medium format film, cinematic color grading
+
+Negative: worst quality, low quality, blurry, deformed, mutated, ugly, disfigured, text, error, extra limbs, missing limbs, gross proportions, jpeg artifacts, lowres, low contrast, monochrome, grayscale, flat lighting.
+
+CFG: 5.0
+
+Steps: 20
+
+Scheduler: DDRK_Auto

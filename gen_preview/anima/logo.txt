@@ -1,0 +1,19 @@
+Positive: Clean engineering logo on pure white background for "DDRK Omega",
+a production-ready diffusion sampler. Composition: a precise
+technical drawing of an Omega symbol constructed from dashed
+construction lines, dimension arrows, and phase markers (1, 2, 3)
+along its curves — referencing the three-phase sampler architecture.
+Core of the Omega filled with a subtle heat-map gradient
+(cool blue → warm orange) representing the sigma schedule.
+"DDRK" in bold technical font to the left of the symbol,
+"OMEGA" in lighter weight to the right. Minimalist, blueprint
+aesthetic, Swiss design style, generous whitespace, vector graphics,
+perfect symmetry, scalable icon format, 1:1 square.
+
+Negative: worst quality, low quality, blurry, deformed, mutated, ugly, disfigured, text, error, extra limbs, missing limbs, gross proportions, jpeg artifacts, lowres, low contrast, monochrome, grayscale, flat lighting.
+
+CFG: 5.0
+
+Steps: 20
+
+Scheduler: DDRK_Auto
