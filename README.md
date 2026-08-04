@@ -69,7 +69,8 @@ DDRK Omega solves both problems:
 1. Clone or download this repo into your `ComfyUI/custom_nodes/` folder:
 ```bash
 cd ComfyUI/custom_nodes/
-git clone https://github.com/HVOSTOVSKY/ComfyUI-DDRK-Omega.git
+git clone https://github.com/HVOSTOVSKY/DDRK-Omega-Sampler.git
+
 ```
 
 2. Restart ComfyUI. No additional Python packages required.
@@ -184,9 +185,28 @@ This project has an unusual but fully transparent development lineage:
 
 ---
 
+## Known Limitations
+
+- **RK4 is expensive.** ~2.5× model calls vs Euler. Use `auto` integrator to let the sampler decide.
+- **Video mode requires 5D latents.** Standard AnimateDiff output works; single-frame 5D tensors (`[B,C,1,H,W]`) are handled but offer no temporal benefit.
+- **Few-step (<6) forces Euler.** High-order integrators need step budget to show advantage.
+- **No built-in TeaCache / caching.** Each model call is fresh; speedups require external acceleration nodes.
+
+---
+
+## Issues
+
+Found a bug? Open an [Issue](https://github.com/HVOSTOVSKY/DDRK-Omega-Sampler/issues) with:
+- Model name (Anima / Flux / SDXL / etc.)
+- Steps and settings
+- Error traceback (if crash) or comparison images (if quality issue)
+
+---
+
 ## License
 
 MIT License — free for personal and commercial use. Attribution appreciated but not required.
+
 
 ---
 
