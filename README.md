@@ -69,7 +69,7 @@ DDRK Omega solves both problems:
 1. Clone or download this repo into your `ComfyUI/custom_nodes/` folder:
 ```bash
 cd ComfyUI/custom_nodes/
-git clone https://github.com/YOURNAME/ComfyUI-DDRK-Omega.git
+git clone https://github.com/HVOSTOVSKY/ComfyUI-DDRK-Omega.git
 ```
 
 2. Restart ComfyUI. No additional Python packages required.
@@ -169,7 +169,7 @@ All-in-one node. Drop-in replacement for ComfyUI's native KSampler.
 This project has an unusual but fully transparent development lineage:
 
 1. **Original concept & prototype (v1.0)**  
-   Created by **[@yourhandle]** — the core idea of a hybrid phase-based sampler with high-order integrators, SDE noise masking, and SABER temporal stabilization.
+   Created by **HVOSTOVSKY** — the core idea of a hybrid phase-based sampler with high-order integrators, SDE noise masking, and SABER temporal stabilization.
 
 2. **Local AI agent audit loop**  
    The codebase was iteratively reviewed by a local AI assistant, catching architectural inconsistencies and proposing mathematical improvements (adaptive order, sigma-aware schedules, FM/EDM branching).
