@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="ddrk_logo.png" width="400" alt="DDRK Omega Logo">
+</p>
+
 # DDRK Omega Sampler
 ### **D**omain-adaptive **D**iffusion **R**obust **K**ernel
 
