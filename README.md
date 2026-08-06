@@ -166,6 +166,8 @@ All-in-one node. Drop-in replacement for ComfyUI's native KSampler.
 | **v1.1** | Production pass by Kimi (Moonshot AI). Removed broken FSAL-RK4, fixed momentum scope, true Karras schedule, inverted SDE mask, adaptive dynamic thresholding. |
 | **v1.2** | Fixed `local_entropy_mask` 5D reshape, safe sigma-to-float conversion, LRU cache bounds, exposed `sde_seed` in UI, expanded Unified KSampler parameters. |
 | **v1.3** | Fixed SABER2 crash on 5D latents with `F=1` (single-frame video format). Reflect-pad safety for `avg_pool3d`. |
+| **v1.4** | EDM path fixes — less blur, less clamp-aggression, more accurate steps. |
+| **v1.4.1** | Adaptive Balance. |
 
 ---
 
