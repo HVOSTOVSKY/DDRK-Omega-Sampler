@@ -1,9 +1,11 @@
 """
 ================================================================================
-DDRK Omega Sampler — v1.4 EDM-Flow Patch
+DDRK Omega Sampler — v1.4.1 Adaptive Balance
 ComfyUI | Flow Matching + EDM Universal Sampler
 
-v1.4: EDM path fixes — less blur, less clamp-aggression, more accurate steps
+v1.4.1: Soft variance clamp in loop, adaptive DT (skip if no outliers),
+      SABER for EDM only on very early noise. Targets both photoreal
+      texture and anime cleanliness without plastic look.
 ================================================================================
 """
 
@@ -53,15 +55,22 @@ def _detect_family(sigma_max: float) -> str:
 
 def dynamic_threshold(denoised: torch.Tensor, sigma: float, sigma_max: float,
                       percentile: float = 0.995, min_val: float = 1.0,
-                      edm_ratio: float = 0.35) -> torch.Tensor:
+                      edm_ratio: float = 0.30) -> torch.Tensor:
     """
-    v1.4: EDM ratio raised from 0.12 -> 0.35 to avoid over-clamping
-    that kills fine detail on EDM models (Illustrious, SD1.5, SDXL).
+    v1.4.1: EDM ratio 0.30 — clamps early noisy steps only.
+    ADAPTIVE: completely skipped if no actual outliers are present.
+    This preserves photoreal micro-texture while catching CFG blowouts.
     """
     threshold_ratio = 0.40 if sigma_max <= 5.0 else edm_ratio
     if sigma > threshold_ratio * sigma_max or denoised.numel() == 0:
         return denoised
+
+    # Adaptive skip: if max latent magnitude is sane, do nothing
     flat = denoised.reshape(denoised.shape[0], -1)
+    max_val = flat.abs().max(dim=1, keepdim=True)[0]
+    if max_val.max().item() < 3.5:
+        return denoised
+
     abs_flat = flat.abs()
     s = torch.quantile(abs_flat, percentile, dim=1, keepdim=True)
     s = torch.clamp(s, min=min_val)
@@ -69,6 +78,17 @@ def dynamic_threshold(denoised: torch.Tensor, sigma: float, sigma_max: float,
     ratio = s / denoised.abs().clamp_min(1e-8)
     scale = torch.where(ratio < 1.0, ratio, torch.ones_like(ratio))
     return denoised * scale
+
+
+def _soft_clamp(t: torch.Tensor, bound: float = 5.0, softness: float = 0.25) -> torch.Tensor:
+    """
+    v1.4.1: Soft clamp — values inside [-bound, bound] are untouched.
+    Tails beyond the bound are compressed, not hard-cut.
+    Prevents latent explosion without destroying micro-contrast.
+    """
+    core = torch.clamp(t, -bound, bound)
+    excess = t - core
+    return core + softness * excess
 
 
 # =========================================================
@@ -196,13 +216,11 @@ class SABER2:
                 fused = x * (1.0 - chaos * self.fusion) + avg * (chaos * self.fusion)
             return fused
         else:
-            # Spatial mode
             if x.dim() == 4:
                 blurred = F.avg_pool2d(
                     F.pad(x, (1, 1, 1, 1), mode='reflect'), 3, stride=1
                 )
             else:
-                # 5D with F=1 — squeeze to 4D to avoid reflect-pad crash on dim=1
                 if x.shape[2] == 1:
                     x_4d = x.squeeze(2)
                     blurred_4d = F.avg_pool2d(
@@ -210,7 +228,6 @@ class SABER2:
                     )
                     blurred = blurred_4d.unsqueeze(2)
                 else:
-                    # F >= 2: safe to use 3D pooling with reflect pad
                     blurred = F.avg_pool3d(
                         F.pad(x, (1, 1, 1, 1, 1, 1), mode='reflect'), 3, stride=1
                     )
@@ -320,9 +337,8 @@ def _apply_momentum(d: torch.Tensor, state: SamplerState, force: bool = False,
     adaptive_beta = beta * (1.0 - t * 0.5)
     if force:
         adaptive_beta *= 0.5
-    # v1.4: EDM trajectories are more curved — reduce momentum inertia
     if state.is_edm:
-        adaptive_beta *= 0.5
+        adaptive_beta *= 0.6
     d_smooth = adaptive_beta * state.d_prev + (1.0 - adaptive_beta) * d
     state.d_prev = d_smooth.detach().clone()
     return d_smooth
@@ -340,13 +356,11 @@ class AdaptivePhaseRouter:
         self.is_edm = is_edm
 
         if is_edm:
-            # v1.4: EDM needs MORE accurate steps, not less
-            p1_ratio = max(p1_ratio, 0.65)
-            p2_ratio = min(p2_ratio, 0.20)
+            p1_ratio = max(p1_ratio, 0.60)
+            p2_ratio = min(p2_ratio, 0.22)
         else:
-            if is_edm:  # unreachable, kept for clarity
-                p1_ratio = min(p1_ratio, 0.55)
-                p2_ratio = max(p2_ratio, 0.35)
+            p1_ratio = min(p1_ratio, 0.55)
+            p2_ratio = max(p2_ratio, 0.35)
 
         p1 = max(1, min(total_steps - 2, round(total_steps * p1_ratio)))
         p2 = max(1, min(total_steps - p1 - 1, round(total_steps * p2_ratio)))
@@ -558,8 +572,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
         if cfg_rescale > 0:
             mean = out.mean(dim=(2, 3) if out.dim() == 4 else (2, 3, 4), keepdim=True)
             deviation = out - mean
-            # v1.4: Only rescale extreme outliers, preserve normal range
-            mask = deviation.abs() > 2.5
+            mask = deviation.abs() > 3.0
             scaled = deviation / (1.0 + cfg_rescale * deviation.abs())
             out = mean + torch.where(mask, scaled, deviation)
         return out
@@ -591,10 +604,14 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
                 flat_mask = (1.0 - edge_mask) * sde_strength
                 x_next = x_next + sde(x_next, float(sigma_curr), float(sigma_next), sigma_max, flat_mask)
 
+            # v1.4.1: EDM gets very light SABER only on extremely early noise
+            if is_edm and float(sigma_curr) > 0.55 * sigma_max:
+                x_next = saber.fuse(x_next)
+
         elif phase == 2:
             x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
-            # v1.4: Skip SABER on mid-steps for EDM — it blurs detail that EDM is still building
-            if not is_edm or float(sigma_curr) > 0.4 * sigma_max:
+            # v1.4.1: No SABER on phase 2 for EDM — mid-step blur causes artifacts
+            if not is_edm:
                 x_next = saber.fuse(x_next)
 
         else:
@@ -604,9 +621,9 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             if i == total_steps - 1 and sharpness > 0:
                 x_next = perceptual_sharpen(x_next, sharpness, is_final_step=True)
 
-        # v1.4: Hard latent clamp for EDM to prevent VAE artifacts from exploding latents
+        # v1.4.1: Soft clamp for EDM — compresses extreme tails without killing micro-contrast
         if is_edm:
-            x_next = torch.clamp(x_next, min=-4.0, max=4.0)
+            x_next = _soft_clamp(x_next, bound=5.0, softness=0.25)
 
         x = x_next
 
@@ -619,6 +636,8 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
                 'denoised': preview_denoised,
             })
 
+    # v1.4.1: Wide final safety clamp — prevents VAE crash from rare explosions
+    x = torch.clamp(x, -7.0, 7.0)
     return x
 
 
