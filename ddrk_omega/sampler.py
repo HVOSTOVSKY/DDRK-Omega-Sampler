@@ -1,9 +1,9 @@
 """
 ================================================================================
-DDRK Omega Sampler — v1.3 Hotfix
+DDRK Omega Sampler — v1.4 EDM-Flow Patch
 ComfyUI | Flow Matching + EDM Universal Sampler
 
-v1.3: Fixed SABER2 crash on 5D latents with F=1 (single-frame video format)
+v1.4: EDM path fixes — less blur, less clamp-aggression, more accurate steps
 ================================================================================
 """
 
@@ -29,6 +29,7 @@ class SamplerState:
     d_prev: Optional[torch.Tensor] = None
     step_count: int = 0
     total_steps: int = 0
+    is_edm: bool = False
 
 
 class DeviceDtypeGuard:
@@ -51,8 +52,13 @@ def _detect_family(sigma_max: float) -> str:
 # =========================================================
 
 def dynamic_threshold(denoised: torch.Tensor, sigma: float, sigma_max: float,
-                      percentile: float = 0.995, min_val: float = 1.0) -> torch.Tensor:
-    threshold_ratio = 0.40 if sigma_max <= 5.0 else 0.12
+                      percentile: float = 0.995, min_val: float = 1.0,
+                      edm_ratio: float = 0.35) -> torch.Tensor:
+    """
+    v1.4: EDM ratio raised from 0.12 -> 0.35 to avoid over-clamping
+    that kills fine detail on EDM models (Illustrious, SD1.5, SDXL).
+    """
+    threshold_ratio = 0.40 if sigma_max <= 5.0 else edm_ratio
     if sigma > threshold_ratio * sigma_max or denoised.numel() == 0:
         return denoised
     flat = denoised.reshape(denoised.shape[0], -1)
@@ -314,6 +320,9 @@ def _apply_momentum(d: torch.Tensor, state: SamplerState, force: bool = False,
     adaptive_beta = beta * (1.0 - t * 0.5)
     if force:
         adaptive_beta *= 0.5
+    # v1.4: EDM trajectories are more curved — reduce momentum inertia
+    if state.is_edm:
+        adaptive_beta *= 0.5
     d_smooth = adaptive_beta * state.d_prev + (1.0 - adaptive_beta) * d
     state.d_prev = d_smooth.detach().clone()
     return d_smooth
@@ -331,8 +340,13 @@ class AdaptivePhaseRouter:
         self.is_edm = is_edm
 
         if is_edm:
-            p1_ratio = min(p1_ratio, 0.55)
-            p2_ratio = max(p2_ratio, 0.35)
+            # v1.4: EDM needs MORE accurate steps, not less
+            p1_ratio = max(p1_ratio, 0.65)
+            p2_ratio = min(p2_ratio, 0.20)
+        else:
+            if is_edm:  # unreachable, kept for clarity
+                p1_ratio = min(p1_ratio, 0.55)
+                p2_ratio = max(p2_ratio, 0.35)
 
         p1 = max(1, min(total_steps - 2, round(total_steps * p1_ratio)))
         p2 = max(1, min(total_steps - p1 - 1, round(total_steps * p2_ratio)))
@@ -528,7 +542,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
         if integrator == "rk4":
             integrator = "heun"
 
-    state = SamplerState(total_steps=total_steps)
+    state = SamplerState(total_steps=total_steps, is_edm=is_edm)
     router = AdaptivePhaseRouter(total_steps, sigma_max, is_edm)
     saber = SABER2(mode=saber_mode, buffer_size=3, fusion=saber_fusion,
                    ema_decay=ema_decay, use_ema=use_ema_saber)
@@ -543,7 +557,11 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             out = dynamic_threshold(out, float(sigma_val), sigma_max, dyn_thresh_percentile)
         if cfg_rescale > 0:
             mean = out.mean(dim=(2, 3) if out.dim() == 4 else (2, 3, 4), keepdim=True)
-            out = mean + (out - mean) / (1.0 + cfg_rescale * (out - mean).abs())
+            deviation = out - mean
+            # v1.4: Only rescale extreme outliers, preserve normal range
+            mask = deviation.abs() > 2.5
+            scaled = deviation / (1.0 + cfg_rescale * deviation.abs())
+            out = mean + torch.where(mask, scaled, deviation)
         return out
 
     preview_denoised = None
@@ -575,7 +593,9 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
 
         elif phase == 2:
             x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
-            x_next = saber.fuse(x_next)
+            # v1.4: Skip SABER on mid-steps for EDM — it blurs detail that EDM is still building
+            if not is_edm or float(sigma_curr) > 0.4 * sigma_max:
+                x_next = saber.fuse(x_next)
 
         else:
             x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
@@ -583,6 +603,10 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
                 x_next = saber.fuse(x_next)
             if i == total_steps - 1 and sharpness > 0:
                 x_next = perceptual_sharpen(x_next, sharpness, is_final_step=True)
+
+        # v1.4: Hard latent clamp for EDM to prevent VAE artifacts from exploding latents
+        if is_edm:
+            x_next = torch.clamp(x_next, min=-4.0, max=4.0)
 
         x = x_next
 
