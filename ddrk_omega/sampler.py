@@ -1,8 +1,15 @@
 """
 ================================================================================
-DDRK Omega Sampler — v1.4.1 Adaptive Balance
+DDRK Omega Sampler — v1.4.2 Photo-Fix
 ComfyUI | Flow Matching + EDM Universal Sampler
 
+v1.4.2: Photo-aware defaults for Flow Matching (FM) models like Krea2.
+      - No SABER on Phase 2 for FM (preserves micro-texture)
+      - SDE gated by entropy + quadratic edge-mask falloff
+      - Final sharpen always uses entropy mask
+      - Universal dynamic thresholding (FM + EDM)
+      - Gentle soft clamp for FM latents
+      - Auto-capped momentum and SABER for photo-realism
 v1.4.1: Soft variance clamp in loop, adaptive DT (skip if no outliers),
       SABER for EDM only on very early noise. Targets both photoreal
       texture and anime cleanliness without plastic look.
@@ -547,13 +554,22 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     sigma_max = float(sigmas.max())
     is_edm = sigma_max > 5.0
 
-    if total_steps <= 6:
-        integrator = "euler"
-        saber_fusion = min(saber_fusion, 0.15)
-        sharpness = min(sharpness, 0.2)
-        sde_strength = 0.0
-    elif total_steps <= 10:
-        if integrator == "rk4":
+    # --- v1.4.2: Photo-aware defaults for Flow Matching ---
+    if not is_edm:
+        # FM/photo models: less blur, less noise, less momentum
+        saber_fusion = min(saber_fusion, 0.15)   # cap blur on photo
+        sde_strength = min(sde_strength, 0.04)   # reduce grain
+        momentum_beta = min(momentum_beta, 0.15) # less inertia
+        # Use heun or euler, avoid RK4 oversmooth on photos
+        if integrator == "auto" and total_steps >= 10:
+            integrator = "heun"
+    else:
+        if total_steps <= 6:
+            integrator = "euler"
+            saber_fusion = min(saber_fusion, 0.15)
+            sharpness = min(sharpness, 0.2)
+            sde_strength = 0.0
+        elif total_steps <= 10 and integrator == "rk4":
             integrator = "heun"
 
     state = SamplerState(total_steps=total_steps, is_edm=is_edm)
@@ -567,7 +583,8 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
 
     def model_fn(latent_in, sigma_val):
         out = model(latent_in.to(work_dtype), sigma_val * s_in, **extra_args).to(work_dtype)
-        if is_edm and dyn_thresh_percentile < 1.0:
+        # v1.4.2: Enable dyn-thresh for FM too (Krea2 can CFG-blow)
+        if dyn_thresh_percentile < 1.0:
             out = dynamic_threshold(out, float(sigma_val), sigma_max, dyn_thresh_percentile)
         if cfg_rescale > 0:
             mean = out.mean(dim=(2, 3) if out.dim() == 4 else (2, 3, 4), keepdim=True)
@@ -599,31 +616,43 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             else:
                 x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
 
+            # v1.4.2: SDE only for FM, but stricter flat-region mask
             if not is_edm and sde_strength > 0 and float(sigma_next) > 1e-7:
                 edge_mask = log_mask(x_next)
-                flat_mask = (1.0 - edge_mask) * sde_strength
-                x_next = x_next + sde(x_next, float(sigma_curr), float(sigma_next), sigma_max, flat_mask)
+                # Quadratic falloff + entropy gate: noise ONLY in truly flat areas
+                entropy = local_entropy_mask(x_next, window=3)
+                flat_mask = ((1.0 - edge_mask) ** 2) * entropy * sde_strength
+                # Only inject if we're still early enough (sigma > 30% of max)
+                if float(sigma_curr) > 0.30 * sigma_max:
+                    x_next = x_next + sde(x_next, float(sigma_curr), float(sigma_next), sigma_max, flat_mask)
 
-            # v1.4.1: EDM gets very light SABER only on extremely early noise
+            # EDM: very light SABER only on extreme early noise (unchanged logic)
             if is_edm and float(sigma_curr) > 0.55 * sigma_max:
                 x_next = saber.fuse(x_next)
 
         elif phase == 2:
             x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
-            # v1.4.1: No SABER on phase 2 for EDM — mid-step blur causes artifacts
-            if not is_edm:
+            # v1.4.2: NO SABER on phase 2 for FM — this is where photo texture lives
+            if is_edm:
+                x_next = saber.fuse(x_next)
+            # For video FM we still allow it, but only if explicitly 5D video
+            elif x_next.dim() == 5 and x_next.shape[2] > 1 and saber_mode in ("video", "auto"):
                 x_next = saber.fuse(x_next)
 
-        else:
+        else:  # phase 3
             x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
             if saber_mode in ("video", "auto") and x_next.dim() == 5 and x_next.shape[2] > 1:
                 x_next = saber.fuse(x_next)
             if i == total_steps - 1 and sharpness > 0:
-                x_next = perceptual_sharpen(x_next, sharpness, is_final_step=True)
+                # v1.4.2: Always use entropy mask for sharpen, even on final step
+                x_next = perceptual_sharpen(x_next, sharpness, is_final_step=False)
 
-        # v1.4.1: Soft clamp for EDM — compresses extreme tails without killing micro-contrast
+        # Soft clamp for EDM (unchanged)
         if is_edm:
             x_next = _soft_clamp(x_next, bound=5.0, softness=0.25)
+        else:
+            # v1.4.2: Gentle soft clamp for FM too — prevents rare latent spikes
+            x_next = _soft_clamp(x_next, bound=6.0, softness=0.15)
 
         x = x_next
 
@@ -636,7 +665,6 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
                 'denoised': preview_denoised,
             })
 
-    # v1.4.1: Wide final safety clamp — prevents VAE crash from rare explosions
     x = torch.clamp(x, -7.0, 7.0)
     return x
 
