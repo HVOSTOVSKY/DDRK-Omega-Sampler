@@ -1,17 +1,11 @@
 """
 ================================================================================
-DDRK Omega Sampler — v1.4.2 Photo-Fix
+DDRK Omega Sampler — v1.4.3 Audit Fixes + Quality Features
 ComfyUI | Flow Matching + EDM Universal Sampler
 
-v1.4.2: Photo-aware defaults for Flow Matching (FM) models like Krea2.
-      - No SABER on Phase 2 for FM (preserves micro-texture)
-      - SDE gated by entropy + quadratic edge-mask falloff
-      - Final sharpen always uses entropy mask
-      - Universal dynamic thresholding (FM + EDM)
-      - Gentle soft clamp for FM latents
-      - Auto-capped momentum and SABER for photo-realism
-v1.4.1: Soft variance clamp in loop, adaptive DT (skip if no outliers),
-      SABER for EDM only on very early noise. Targets both photoreal
+v1.4.3: All audit fixes + quality features. Fixed adaptive order
+      curvature placeholder, phase fade start, content-aware SABER now
+      toggleable in UI. EDM churn, multi-scale sharpen, std-matching CFG rescale.
       texture and anime cleanliness without plastic look.
 ================================================================================
 """
@@ -39,6 +33,8 @@ class SamplerState:
     step_count: int = 0
     total_steps: int = 0
     is_edm: bool = False
+    prev_denoised: Optional[torch.Tensor] = None
+    prev_sigma: float = 0.0
 
 
 class DeviceDtypeGuard:
@@ -63,16 +59,11 @@ def _detect_family(sigma_max: float) -> str:
 def dynamic_threshold(denoised: torch.Tensor, sigma: float, sigma_max: float,
                       percentile: float = 0.995, min_val: float = 1.0,
                       edm_ratio: float = 0.30) -> torch.Tensor:
-    """
-    v1.4.1: EDM ratio 0.30 — clamps early noisy steps only.
-    ADAPTIVE: completely skipped if no actual outliers are present.
-    This preserves photoreal micro-texture while catching CFG blowouts.
-    """
+
     threshold_ratio = 0.40 if sigma_max <= 5.0 else edm_ratio
     if sigma > threshold_ratio * sigma_max or denoised.numel() == 0:
         return denoised
 
-    # Adaptive skip: if max latent magnitude is sane, do nothing
     flat = denoised.reshape(denoised.shape[0], -1)
     max_val = flat.abs().max(dim=1, keepdim=True)[0]
     if max_val.max().item() < 3.5:
@@ -88,11 +79,7 @@ def dynamic_threshold(denoised: torch.Tensor, sigma: float, sigma_max: float,
 
 
 def _soft_clamp(t: torch.Tensor, bound: float = 5.0, softness: float = 0.25) -> torch.Tensor:
-    """
-    v1.4.1: Soft clamp — values inside [-bound, bound] are untouched.
-    Tails beyond the bound are compressed, not hard-cut.
-    Prevents latent explosion without destroying micro-contrast.
-    """
+
     core = torch.clamp(t, -bound, bound)
     excess = t - core
     return core + softness * excess
@@ -165,13 +152,14 @@ def local_entropy_mask(x: torch.Tensor, window: int = 3) -> torch.Tensor:
 class SABER2:
     def __init__(self, mode: str = "auto", buffer_size: int = 3,
                  fusion: float = 0.35, ema_decay: float = 0.7, use_ema: bool = True,
-                 max_keys: int = 4):
+                 max_keys: int = 4, content_aware: bool = True):
         self.mode = mode
         self.buffer_size = buffer_size
         self.fusion = fusion
         self.ema_decay = ema_decay
         self.use_ema = use_ema
         self._max_keys = max_keys
+        self.content_aware = content_aware
         self._buffers: OrderedDict[str, Any] = OrderedDict()
 
     def _is_video(self, x: torch.Tensor) -> bool:
@@ -205,8 +193,37 @@ class SABER2:
         if len(buf["frames"]) > self.buffer_size:
             buf["frames"].pop(0)
 
-        if len(buf["frames"]) < 2:
+        if is_vid and len(buf["frames"]) < 2:
             return x
+
+        fusion_weight = self.fusion
+        if self.content_aware and not is_vid:
+            if x.dim() == 4:
+                k3 = torch.tensor([[0,1,0],[1,-4,1],[0,1,0]], dtype=x.dtype, device=x.device).view(1,1,3,3)
+                k3 = k3.repeat(x.shape[1], 1, 1, 1)
+                log3 = F.conv2d(F.pad(x, (1,1,1,1), mode='reflect'), k3, groups=x.shape[1]).abs()
+                blur5 = F.avg_pool2d(F.pad(x, (2,2,2,2), mode='reflect'), 5, stride=1)
+                edge5 = (x - blur5).abs()
+                combined = (log3 + edge5) * 0.5
+                edge_density = torch.sigmoid((combined - combined.mean()) * 15.0)
+                fusion_weight = self.fusion * (1.0 - edge_density)
+            else:
+                if x.shape[2] == 1:
+                    x_4d = x.squeeze(2)
+                    k3 = torch.tensor([[0,1,0],[1,-4,1],[0,1,0]], dtype=x.dtype, device=x.device).view(1,1,3,3)
+                    k3 = k3.repeat(x_4d.shape[1], 1, 1, 1)
+                    log3 = F.conv2d(F.pad(x_4d, (1,1,1,1), mode='reflect'), k3, groups=x_4d.shape[1]).abs()
+                    blur5 = F.avg_pool2d(F.pad(x_4d, (2,2,2,2), mode='reflect'), 5, stride=1)
+                    edge5 = (x_4d - blur5).abs()
+                    combined = (log3 + edge5) * 0.5
+                    edge_density = torch.sigmoid((combined - combined.mean()) * 15.0)
+                    fusion_weight = self.fusion * (1.0 - edge_density)
+                    fusion_weight = fusion_weight.unsqueeze(2)
+                else:
+                    blur3 = F.avg_pool3d(F.pad(x, (1,1,1,1,1,1), mode='reflect'), 3, stride=1)
+                    edge3 = (x - blur3).abs()
+                    edge_density = torch.sigmoid((edge3 - edge3.mean()) * 20.0)
+                    fusion_weight = self.fusion * (1.0 - edge_density)
 
         if is_vid:
             stacked = torch.stack(buf["frames"], dim=0)
@@ -217,10 +234,10 @@ class SABER2:
                     buf["ema"] = x.detach().clone()
                 else:
                     buf["ema"] = self.ema_decay * buf["ema"] + (1 - self.ema_decay) * x.detach()
-                fused = x * (1.0 - chaos * self.fusion) + buf["ema"] * (chaos * self.fusion)
+                fused = x * (1.0 - chaos * fusion_weight) + buf["ema"] * (chaos * fusion_weight)
             else:
                 avg = torch.mean(stacked, dim=0)
-                fused = x * (1.0 - chaos * self.fusion) + avg * (chaos * self.fusion)
+                fused = x * (1.0 - chaos * fusion_weight) + avg * (chaos * fusion_weight)
             return fused
         else:
             if x.dim() == 4:
@@ -238,10 +255,11 @@ class SABER2:
                     blurred = F.avg_pool3d(
                         F.pad(x, (1, 1, 1, 1, 1, 1), mode='reflect'), 3, stride=1
                     )
-            edges = (x - blurred).abs()
-            edge_weight = torch.sigmoid((edges - edges.mean()) * 20.0)
-            w = self.fusion * (1.0 - edge_weight)
-            return x * (1.0 - w) + blurred * w
+            if isinstance(fusion_weight, float):
+                w = fusion_weight
+                return x * (1.0 - w) + blurred * w
+            else:
+                return x * (1.0 - fusion_weight) + blurred * fusion_weight
 
 
 # =========================================================
@@ -260,15 +278,22 @@ def perceptual_sharpen(x: torch.Tensor, strength: float = 0.35,
     else:
         x_4d = x
 
-    blurred = F.avg_pool2d(F.pad(x_4d, (1, 1, 1, 1), mode='reflect'), 3, stride=1)
-    detail = x_4d - blurred
+    blur_3x3 = F.avg_pool2d(F.pad(x_4d, (1, 1, 1, 1), mode='reflect'), 3, stride=1)
+    detail_fine = x_4d - blur_3x3
+
+    blur_5x5 = F.avg_pool2d(F.pad(x_4d, (2, 2, 2, 2), mode='reflect'), 5, stride=1)
+    detail_coarse = x_4d - blur_5x5
 
     if not is_final_step:
         mask = local_entropy_mask(x_4d, window=3)
-        detail = detail * mask
+        edge_boost = 1.0 - mask
+        detail_fine = detail_fine * edge_boost
+        detail_coarse = detail_coarse * edge_boost
 
-    detail = torch.clamp(detail, min=-0.6, max=0.6)
-    out = x_4d + strength * detail
+    detail_fine = torch.clamp(detail_fine, min=-0.6, max=0.6)
+    detail_coarse = torch.clamp(detail_coarse, min=-0.6, max=0.6)
+
+    out = x_4d + strength * (0.6 * detail_fine + 0.4 * detail_coarse)
 
     if is_5d:
         out = out.view(b, f, c, h, w).permute(0, 2, 1, 3, 4)
@@ -283,15 +308,15 @@ def _safe_sigma(s: Union[float, torch.Tensor]) -> float:
     return max(float(s), 1e-8)
 
 
-def euler_step(x, sigma, sigma_next, model_fn, state: SamplerState):
+def euler_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta: float = None):
     denoised = model_fn(x, sigma)
     d = (x - denoised) / _safe_sigma(sigma)
-    d = _apply_momentum(d, state)
+    d = _apply_momentum(d, state, momentum_beta=momentum_beta)
     dt = sigma_next - sigma
     return x + d * dt, denoised, d
 
 
-def heun_step(x, sigma, sigma_next, model_fn, state: SamplerState):
+def heun_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta: float = None):
     denoised = model_fn(x, sigma)
     d = (x - denoised) / _safe_sigma(sigma)
     dt = sigma_next - sigma
@@ -301,15 +326,15 @@ def heun_step(x, sigma, sigma_next, model_fn, state: SamplerState):
         denoised_2 = model_fn(x_next, sigma_next)
         d2 = (x_next - denoised_2) / _safe_sigma(sigma_next)
         d_avg = (d + d2) * 0.5
-        d_avg = _apply_momentum(d_avg, state, force=True)
+        d_avg = _apply_momentum(d_avg, state, force=True, momentum_beta=momentum_beta)
         x_next = x + d_avg * dt
         return x_next, denoised_2, d_avg
 
-    _apply_momentum(d, state)
+    _apply_momentum(d, state, momentum_beta=momentum_beta)
     return x_next, denoised, d
 
 
-def rk4_step(x, sigma, sigma_next, model_fn, state: SamplerState):
+def rk4_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta: float = None):
     dt = sigma_next - sigma
     s = _safe_sigma(sigma)
     s_mid = _safe_sigma(sigma + dt * 0.5)
@@ -331,12 +356,14 @@ def rk4_step(x, sigma, sigma_next, model_fn, state: SamplerState):
     d4 = (x_k4 - denoised_4) / s_next
 
     d_final = (d1 + 2 * d2 + 2 * d3 + d4) / 6.0
-    d_final = _apply_momentum(d_final, state, force=True)
+    d_final = _apply_momentum(d_final, state, force=True, momentum_beta=momentum_beta)
     return x + d_final * dt, denoised_4, d_final
 
 
 def _apply_momentum(d: torch.Tensor, state: SamplerState, force: bool = False,
-                    beta: float = 0.25) -> torch.Tensor:
+                    beta: float = 0.25, momentum_beta: float = None) -> torch.Tensor:
+    if momentum_beta is not None:
+        beta = momentum_beta
     if state.d_prev is None:
         state.d_prev = d.detach().clone()
         return d
@@ -361,6 +388,12 @@ class AdaptivePhaseRouter:
         self.total_steps = total_steps
         self.sigma_max = sigma_max
         self.is_edm = is_edm
+
+        if total_steps <= 2:
+            self.p1_end = total_steps
+            self.p2_end = total_steps
+            self.p3_start = total_steps
+            return
 
         if is_edm:
             p1_ratio = max(p1_ratio, 0.60)
@@ -392,15 +425,28 @@ class AdaptivePhaseRouter:
             return 2
         return 3
 
-    def pick_integrator(self, step_idx: int, sigma: float, cfg: str) -> str:
+    def pick_integrator(self, step_idx: int, sigma: float, cfg: str,
+                        state: SamplerState = None) -> str:
         phase = self.get_phase(step_idx)
         if cfg == "auto":
-            if phase == 1 and self.total_steps >= 10 and not self.is_edm:
-                if sigma > 0.3 * self.sigma_max:
-                    return "rk4"
-                return "heun"
-            elif phase == 1 and self.is_edm:
-                return "heun"
+            if phase == 1:
+                if state is not None and state.prev_denoised is not None:
+                    with torch.no_grad():
+                        curvature = getattr(state, 'curvature', 0.0)
+                        if curvature > 0.15 and self.total_steps >= 10:
+                            return "rk4"
+                        elif curvature > 0.05:
+                            return "heun"
+                        else:
+                            return "euler"
+                if not self.is_edm and self.total_steps >= 10:
+                    if sigma > 0.3 * self.sigma_max:
+                        return "rk4"
+                    return "heun"
+                elif self.is_edm:
+                    return "heun"
+                else:
+                    return "heun"  
             elif phase == 2:
                 return "heun" if self.total_steps >= 8 else "euler"
             else:
@@ -474,9 +520,9 @@ def get_ddrk_sigmas(scheduler_type: str, steps: int, sigma_min: float,
         elif scheduler_type == "ddrk_flow_cosmos":
             t = torch.linspace(1.0, 0.0, steps, device=device)
             t_shifted = _flow_shift(t, flow_shift)
-            tail = (t_shifted < 0.3).float()
+            weight = torch.sigmoid((0.3 - t_shifted) * 20.0)
             sig = torch.sigmoid((t_shifted - 0.3) * -5.0)
-            t_adj = t_shifted * (1.0 - tail * sig * 0.15)
+            t_adj = t_shifted * (1.0 - weight * sig * 0.15)
             sigmas = t_adj
         else:
             t = torch.linspace(1.0, 0.0, steps, device=device)
@@ -485,7 +531,7 @@ def get_ddrk_sigmas(scheduler_type: str, steps: int, sigma_min: float,
                 w = min(warmup_steps, max(1, steps // 8))
                 for i in range(1, w + 1):
                     sigmas[i] *= 1.0 + 0.02 * (1.0 - (i - 1) / max(w, 1))
-                for i in range(w, 0, -1):
+                for i in range(1, w + 1):
                     sigmas[i] = min(sigmas[i], sigmas[i - 1] - 1e-7)
             sigmas[0] = 1.0
 
@@ -495,20 +541,23 @@ def get_ddrk_sigmas(scheduler_type: str, steps: int, sigma_min: float,
     elif scheduler_type.startswith("ddrk_edm"):
         if scheduler_type == "ddrk_edm_karras":
             rho = 7.0
-            ramp = torch.linspace(0, 1, steps + 1, device=device)
+            ramp = torch.linspace(0, 1, steps, device=device)
             sigmas = (sigma_max ** (1.0 / rho) +
                       ramp * (sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho))) ** rho
             sigmas = torch.clamp(sigmas, min=sigma_min)
+            sigmas = torch.cat([sigmas, torch.tensor([0.0], device=device)])
             return sigmas
         elif scheduler_type == "ddrk_edm_poly":
-            ramp = torch.linspace(0, 1, steps + 1, device=device)
+            ramp = torch.linspace(0, 1, steps, device=device)
             sigmas = sigma_max * (1.0 - ramp ** 2) + sigma_min * (ramp ** 2)
             sigmas = torch.where(sigmas < sigma_min,
                                  torch.tensor(sigma_min, device=device), sigmas)
+            sigmas = torch.cat([sigmas, torch.tensor([0.0], device=device)])
             return sigmas
         else:
-            ramp = torch.linspace(0, 1, steps + 1, device=device)
+            ramp = torch.linspace(0, 1, steps, device=device)
             sigmas = sigma_max * (sigma_min / sigma_max) ** ramp
+            sigmas = torch.cat([sigmas, torch.tensor([0.0], device=device)])
             return sigmas
 
     if sigma_max > 5.0:
@@ -540,6 +589,10 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     dyn_thresh_percentile = kwargs.get("dyn_thresh_percentile", 0.995)
     cfg_rescale = kwargs.get("cfg_rescale", 0.0)
     momentum_beta = kwargs.get("momentum_beta", 0.25)
+    s_churn = kwargs.get("s_churn", 0.0)
+    s_tmin = kwargs.get("s_tmin", 0.0)
+    s_tmax = float('inf')
+    s_noise = kwargs.get("s_noise", 1.0)
 
     work_device = comfy.model_management.get_torch_device()
     work_dtype = x.dtype
@@ -554,28 +607,28 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     sigma_max = float(sigmas.max())
     is_edm = sigma_max > 5.0
 
-    # --- v1.4.2: Photo-aware defaults for Flow Matching ---
+    if total_steps <= 6:
+        integrator = "euler"
+        saber_fusion = min(saber_fusion, 0.15)
+        sharpness = min(sharpness, 0.2)
+        sde_strength = 0.0
     if not is_edm:
-        # FM/photo models: less blur, less noise, less momentum
-        saber_fusion = min(saber_fusion, 0.15)   # cap blur on photo
-        sde_strength = min(sde_strength, 0.04)   # reduce grain
-        momentum_beta = min(momentum_beta, 0.15) # less inertia
-        # Use heun or euler, avoid RK4 oversmooth on photos
-        if integrator == "auto" and total_steps >= 10:
-            integrator = "heun"
-    else:
-        if total_steps <= 6:
-            integrator = "euler"
-            saber_fusion = min(saber_fusion, 0.15)
-            sharpness = min(sharpness, 0.2)
-            sde_strength = 0.0
-        elif total_steps <= 10 and integrator == "rk4":
+        if total_steps <= 10:
+            sharpness = min(sharpness, 0.12)
+        else:
+            sharpness = min(sharpness, 0.15)
+        saber_fusion = min(saber_fusion, 0.15)
+        momentum_beta = min(momentum_beta, 0.15)
+    elif total_steps <= 10:
+        if integrator == "rk4":
             integrator = "heun"
 
     state = SamplerState(total_steps=total_steps, is_edm=is_edm)
     router = AdaptivePhaseRouter(total_steps, sigma_max, is_edm)
+    content_aware = kwargs.get("content_aware", True)
     saber = SABER2(mode=saber_mode, buffer_size=3, fusion=saber_fusion,
-                   ema_decay=ema_decay, use_ema=use_ema_saber)
+                   ema_decay=ema_decay, use_ema=use_ema_saber,
+                   content_aware=content_aware)
     sde = AdaptiveSDE(seed=sde_seed)
     log_mask = LoGMask()
 
@@ -583,15 +636,15 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
 
     def model_fn(latent_in, sigma_val):
         out = model(latent_in.to(work_dtype), sigma_val * s_in, **extra_args).to(work_dtype)
-        # v1.4.2: Enable dyn-thresh for FM too (Krea2 can CFG-blow)
         if dyn_thresh_percentile < 1.0:
             out = dynamic_threshold(out, float(sigma_val), sigma_max, dyn_thresh_percentile)
         if cfg_rescale > 0:
-            mean = out.mean(dim=(2, 3) if out.dim() == 4 else (2, 3, 4), keepdim=True)
+            dims = (2, 3) if out.dim() == 4 else (2, 3, 4)
+            mean = out.mean(dim=dims, keepdim=True)
+            std = out.std(dim=dims, keepdim=True).clamp_min(1e-8)
             deviation = out - mean
-            mask = deviation.abs() > 3.0
-            scaled = deviation / (1.0 + cfg_rescale * deviation.abs())
-            out = mean + torch.where(mask, scaled, deviation)
+            scale_factor = 1.0 / (1.0 + cfg_rescale * (deviation.abs() / std - 2.0).clamp_min(0.0))
+            out = mean + deviation * scale_factor
         return out
 
     preview_denoised = None
@@ -605,54 +658,71 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
         if float(sigma_curr) < 1e-7:
             break
 
+        if is_edm and s_churn > 0 and s_tmin <= float(sigma_curr) <= s_tmax:
+            gamma = min(s_churn / float(sigma_curr), math.sqrt(2) - 1)
+            sigma_hat = float(sigma_curr) * (1.0 + gamma)
+            noise = torch.randn_like(x) * s_noise
+            x = x + noise * math.sqrt(sigma_hat ** 2 - float(sigma_curr) ** 2)
+            sigma_curr = torch.tensor(sigma_hat, device=work_device, dtype=torch.float32)
+
         phase = router.get_phase(i)
-        chosen_integrator = router.pick_integrator(i, float(sigma_curr), integrator)
+        chosen_integrator = router.pick_integrator(i, float(sigma_curr), integrator, state)
 
         if phase == 1:
             if chosen_integrator == "rk4":
-                x_next, preview_denoised, _ = rk4_step(x, sigma_curr, sigma_next, model_fn, state)
+                x_next, preview_denoised, _ = rk4_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
             elif chosen_integrator == "heun":
-                x_next, preview_denoised, _ = heun_step(x, sigma_curr, sigma_next, model_fn, state)
+                x_next, preview_denoised, _ = heun_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
             else:
-                x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
+                x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
 
-            # v1.4.2: SDE only for FM, but stricter flat-region mask
             if not is_edm and sde_strength > 0 and float(sigma_next) > 1e-7:
                 edge_mask = log_mask(x_next)
-                # Quadratic falloff + entropy gate: noise ONLY in truly flat areas
-                entropy = local_entropy_mask(x_next, window=3)
-                flat_mask = ((1.0 - edge_mask) ** 2) * entropy * sde_strength
-                # Only inject if we're still early enough (sigma > 30% of max)
-                if float(sigma_curr) > 0.30 * sigma_max:
-                    x_next = x_next + sde(x_next, float(sigma_curr), float(sigma_next), sigma_max, flat_mask)
+                entropy = local_entropy_mask(x_next, window=5)
+                flat_mask = (1.0 - edge_mask) * entropy * sde_strength
+                x_next = x_next + sde(x_next, float(sigma_curr), float(sigma_next), sigma_max, flat_mask)
 
-            # EDM: very light SABER only on extreme early noise (unchanged logic)
             if is_edm and float(sigma_curr) > 0.55 * sigma_max:
                 x_next = saber.fuse(x_next)
 
         elif phase == 2:
-            x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
-            # v1.4.2: NO SABER on phase 2 for FM — this is where photo texture lives
-            if is_edm:
-                x_next = saber.fuse(x_next)
-            # For video FM we still allow it, but only if explicitly 5D video
-            elif x_next.dim() == 5 and x_next.shape[2] > 1 and saber_mode in ("video", "auto"):
+            if chosen_integrator == "rk4":
+                x_next, preview_denoised, _ = rk4_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+            elif chosen_integrator == "heun":
+                x_next, preview_denoised, _ = heun_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+            else:
+                x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+            if not is_edm:
                 x_next = saber.fuse(x_next)
 
-        else:  # phase 3
-            x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state)
+        else:
+            if chosen_integrator == "rk4":
+                x_next, preview_denoised, _ = rk4_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+            elif chosen_integrator == "heun":
+                x_next, preview_denoised, _ = heun_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+            else:
+                x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
             if saber_mode in ("video", "auto") and x_next.dim() == 5 and x_next.shape[2] > 1:
                 x_next = saber.fuse(x_next)
             if i == total_steps - 1 and sharpness > 0:
-                # v1.4.2: Always use entropy mask for sharpen, even on final step
-                x_next = perceptual_sharpen(x_next, sharpness, is_final_step=False)
+                x_next = perceptual_sharpen(x_next, sharpness, is_final_step=True)
 
-        # Soft clamp for EDM (unchanged)
         if is_edm:
             x_next = _soft_clamp(x_next, bound=5.0, softness=0.25)
         else:
-            # v1.4.2: Gentle soft clamp for FM too — prevents rare latent spikes
-            x_next = _soft_clamp(x_next, bound=6.0, softness=0.15)
+            x_next = _soft_clamp(x_next, bound=4.0, softness=0.15)
+
+        if preview_denoised is not None and state.prev_denoised is not None:
+            with torch.no_grad():
+                diff = (preview_denoised - state.prev_denoised).abs().mean()
+                base = state.prev_denoised.abs().mean().clamp_min(1e-8)
+                dsigma = max(abs(float(sigma_curr) - state.prev_sigma), 1e-8)
+                state.curvature = float((diff / base / dsigma).item())
+        else:
+            state.curvature = 0.0
+
+        state.prev_denoised = preview_denoised.detach().clone() if preview_denoised is not None else None
+        state.prev_sigma = float(sigma_curr)
 
         x = x_next
 
@@ -729,7 +799,7 @@ class DDRKOmegaSamplerNode:
                 }),
                 "saber_fusion": ("FLOAT", {
                     "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Stabilization. Auto-capped for EDM."
+                    "tooltip": "Stabilization. Auto-capped to 0.15 for FM photo models."
                 }),
                 "saber_mode": (["auto", "image", "video"], {
                     "default": "auto",
@@ -739,7 +809,7 @@ class DDRKOmegaSamplerNode:
                 "ema_decay": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 0.99, "step": 0.01}),
                 "dyn_thresh_percentile": ("FLOAT", {
                     "default": 0.995, "min": 0.9, "max": 1.0, "step": 0.001,
-                    "tooltip": "Dynamic thresholding percentile. 1.0 = disabled. EDM only."
+                    "tooltip": "Dynamic thresholding percentile. 1.0 = disabled. Universal (FM + EDM)."
                 }),
                 "cfg_rescale": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
@@ -753,6 +823,18 @@ class DDRKOmegaSamplerNode:
                     "default": -1, "min": -1, "max": 0xffffffffffffffff,
                     "tooltip": "SDE noise seed. -1 = random (non-deterministic)."
                 }),
+                "s_churn": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 100.0, "step": 1.0,
+                    "tooltip": "EDM churn (Karras Alg 2). 0 = off. Try 5-15 for SDXL."
+                }),
+                "s_noise": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "EDM churn noise multiplier. 1.0 = standard."
+                }),
+                "content_aware": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Content-aware SABER — edge-gated fusion. Disable for pixel-art/flat styles."
+                }),
             }
         }
 
@@ -762,7 +844,8 @@ class DDRKOmegaSamplerNode:
 
     def get_sampler(self, integrator, sde_strength, sharpness, saber_fusion,
                     saber_mode, use_ema_saber, ema_decay, dyn_thresh_percentile,
-                    cfg_rescale, momentum_beta, sde_seed):
+                    cfg_rescale, momentum_beta, sde_seed, s_churn, s_noise,
+                    content_aware):
         extra = {
             "integrator": integrator,
             "sde_strength": sde_strength,
@@ -775,6 +858,9 @@ class DDRKOmegaSamplerNode:
             "cfg_rescale": cfg_rescale,
             "momentum_beta": momentum_beta,
             "sde_seed": sde_seed if sde_seed >= 0 else None,
+            "s_churn": s_churn,
+            "s_noise": s_noise,
+            "content_aware": content_aware,
         }
         sampler = comfy.samplers.KSAMPLER(sample_ddrk_omega, extra_options=extra)
         return (sampler,)
@@ -816,6 +902,18 @@ class DDRKOmegaUnifiedKSamplerNode:
                 "cfg_rescale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "momentum_beta": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 0.8, "step": 0.05}),
                 "sde_seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
+                "s_churn": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 100.0, "step": 1.0,
+                    "tooltip": "EDM churn (Karras Alg 2). 0 = off. Try 5-15 for SDXL."
+                }),
+                "s_noise": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "EDM churn noise multiplier. 1.0 = standard."
+                }),
+                "content_aware": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Content-aware SABER — edge-gated fusion. Disable for pixel-art/flat styles."
+                }),
             }
         }
 
@@ -827,7 +925,8 @@ class DDRKOmegaUnifiedKSamplerNode:
                denoise, scheduler_type, flow_shift, integrator, sde_strength,
                sharpness, warmup_steps, saber_fusion=0.30, saber_mode="auto",
                use_ema_saber=True, ema_decay=0.7, dyn_thresh_percentile=0.995,
-               cfg_rescale=0.0, momentum_beta=0.25, sde_seed=-1):
+               cfg_rescale=0.0, momentum_beta=0.25, sde_seed=-1,
+               s_churn=0.0, s_noise=1.0, content_aware=True):
         latent = latent_image["samples"]
         noise_mask = latent_image.get("noise_mask", None)
 
@@ -844,11 +943,6 @@ class DDRKOmegaUnifiedKSamplerNode:
         if denoise < 1.0:
             steps_denoised = max(1, int(steps * denoise))
             sigmas = sigmas[-(steps_denoised + 1):]
-            if sigmas[0] < sigma_max:
-                sigmas = torch.cat([
-                    torch.tensor([sigma_max], device=device, dtype=sigmas.dtype),
-                    sigmas
-                ])
 
         noise = comfy.sample.prepare_noise(latent, seed, None)
         if denoise < 1.0:
@@ -866,12 +960,15 @@ class DDRKOmegaUnifiedKSamplerNode:
             "cfg_rescale": cfg_rescale,
             "momentum_beta": momentum_beta,
             "sde_seed": sde_seed if sde_seed >= 0 else None,
+            "s_churn": s_churn,
+            "s_noise": s_noise,
+            "content_aware": content_aware,
         }
         sampler_obj = comfy.samplers.KSAMPLER(sample_ddrk_omega, extra_options=extra)
 
         samples = comfy.sample.sample_custom(
             model, noise, cfg, sampler_obj, sigmas, positive, negative,
-            latent_image=latent, denoise_mask=noise_mask,
+            latent_image=latent, noise_mask=noise_mask,
             callback=None, disable_pbar=False, seed=seed
         )
         return ({"samples": samples},)
