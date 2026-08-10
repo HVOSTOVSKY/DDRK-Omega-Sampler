@@ -204,7 +204,7 @@ All-in-one node. Drop-in replacement for ComfyUI's native KSampler.
 | **v1.3** | Fixed SABER2 crash on 5D latents with `F=1` (single-frame video format). Reflect-pad safety for `avg_pool3d`. |
 | **v1.4** | EDM path fixes — less blur, less clamp-aggression, more accurate steps. |
 | **v1.4.1** | Adaptive Balance. Soft variance clamp, adaptive DT skip, SABER for EDM only on extreme early noise. |
-| **v1.4.3** | **Consolidated Quality & Audit Pass.** Merges all v1.5.x fixes + new features. Bugfixes: `denoise_mask`→`noise_mask`, `denoise<1.0` sigma injection, EDM schedulers reach `σ=0`, integrator honored in all phases, `momentum_beta` threaded, inverted entropy mask in sharpen, router guard `steps≤2`, warmup monotonicity, smooth `flow_cosmos`, SABER2 image gate, EDM off-by-one, universal dyn thresholding, FM auto-caps, Phase 1 Heun for FM 7–9 steps, adaptive order curvature placeholder, phase fade start offset. New features: EDM churn (Karras Alg 2), multi-scale sharpen (3×3+5×5), std-matching CFG rescale, adaptive order by trajectory curvature, phase-boundary fade (1–2 step blend), content-aware SABER (multi-scale edge-gated fusion, UI-toggleable). |
+| **v1.4.3** | **Consolidated Quality & Audit Pass.** Fixes + new features. Bugfixes: `denoise_mask`→`noise_mask`, `denoise<1.0` sigma injection, EDM schedulers reach `σ=0`, integrator honored in all phases, `momentum_beta` threaded, inverted entropy mask in sharpen, router guard `steps≤2`, warmup monotonicity, smooth `flow_cosmos`, SABER2 image gate, EDM off-by-one, universal dyn thresholding, FM auto-caps, Phase 1 Heun for FM 7–9 steps, adaptive order curvature placeholder, phase fade start offset. New features: EDM churn (Karras Alg 2), multi-scale sharpen (3×3+5×5), std-matching CFG rescale, adaptive order by trajectory curvature, phase-boundary fade (1–2 step blend), content-aware SABER (multi-scale edge-gated fusion, UI-toggleable). |
 
 ---
 
@@ -228,7 +228,7 @@ This project has an unusual but fully transparent development lineage:
 
 4. **Photo-realism tuning & logic audit (v1.4.3)**  
    Quality analysis and FM photo-specific calibration. Implemented entropy-gated SDE, soft clamp for FM, adaptive sharpness capping, multi-scale sharpening, EDM churn, std-matching CFG rescale, phase-boundary fade, adaptive order by curvature, and content-aware SABER.  
-   External static-analysis audits (two passes) caught 15+ logic errors: API typos, EDM missing `σ=0`, hardcoded Euler, inverted entropy mask, broken momentum threading, off-by-one steps, universal dyn thresholding, missing FM auto-caps, Phase 1 gap for 7–9 steps. All fixes integrated by Kimi.
+   External static-analysis audits (two passes) caught 15+ logic errors: API typos, EDM missing `σ=0`, hardcoded Euler, inverted entropy mask, broken momentum threading, off-by-one steps, universal dyn thresholding, missing FM auto-caps, Phase 1 gap for 7–9 steps.
 
 ---
 
