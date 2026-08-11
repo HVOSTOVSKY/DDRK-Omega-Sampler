@@ -1,12 +1,11 @@
 """
 ================================================================================
-DDRK Omega Sampler — v1.4.3 Audit Fixes + Quality Features
+DDRK Omega Sampler — v1.5
 ComfyUI | Flow Matching + EDM Universal Sampler
 
-v1.4.3: All audit fixes + quality features. Fixed adaptive order
-      curvature placeholder, phase fade start, content-aware SABER now
-      toggleable in UI. EDM churn, multi-scale sharpen, std-matching CFG rescale.
-      texture and anime cleanliness without plastic look.
+Domain-adaptive diffusion sampler with adaptive phase routing, momentum
+integrators, content-aware SABER stabilization, perceptual sharpening,
+dynamic thresholding, and universal scheduler support.
 ================================================================================
 """
 
@@ -48,8 +47,185 @@ class DeviceDtypeGuard:
         return t.to(device=self.device, dtype=self.dtype)
 
 
-def _detect_family(sigma_max: float) -> str:
-    return "edm" if sigma_max > 5.0 else "flow"
+# =========================================================
+# MODEL FAMILY DETECTION
+# =========================================================
+
+def _detect_model_profile(model, latent_samples=None) -> dict:
+    """
+    Detect model architecture family and recommend SAMPLER parameters only.
+
+    IMPORTANT: steps and cfg are CHECKPOINT properties, not architecture properties.
+    They depend on training recipe, LoRA, distillation, and turbo variants.
+    This function does NOT guess steps/cfg — use your checkpoint card or manual tuning.
+    """
+    profile = {
+        "family": "unknown",
+        "scheduler_type": "ddrk_auto",
+        "flow_shift": 3.0,
+        "integrator": "auto",
+        "sde_strength": 0.08,
+        "sharpness": 0.30,
+        "saber_fusion": 0.30,
+        "momentum_beta": 0.25,
+        "guidance_embed": False,
+        "hint": "Manual tuning required for steps/cfg. See checkpoint card or community docs.",
+    }
+
+    # --- EDM vs Flow detection (reliable) ---
+    is_edm = True
+    try:
+        ms = model.get_model_object("model_sampling")
+        is_edm = float(ms.sigma_max) > 5.0
+    except Exception:
+        pass
+
+    # --- Latent channels (rough family hint) ---
+    latent_ch = 4
+    if latent_samples is not None:
+        try:
+            latent_ch = int(latent_samples.shape[1])
+        except Exception:
+            pass
+
+    # --- Architecture introspection via model.model.model_config ---
+    family = "unknown"
+    image_model = None
+    guidance_embed = False
+    try:
+        # ModelPatcher wraps the real model; config lives on model.model
+        inner_model = getattr(model, "model", None)
+        cfg = getattr(inner_model, "model_config", {}) if inner_model is not None else {}
+        unet = {}
+        if isinstance(cfg, dict):
+            unet = cfg.get("unet_config", {})
+        elif hasattr(cfg, "unet_config"):
+            unet_cfg = cfg.unet_config
+            unet = unet_cfg() if callable(unet_cfg) else unet_cfg
+            if not isinstance(unet, dict):
+                unet = dict(unet) if hasattr(unet, '__dict__') else {}
+
+        if isinstance(unet, dict):
+            image_model = unet.get("image_model")
+            guidance_embed = unet.get("guidance_embed", False)
+            adm = unet.get("adm_in_channels", 0)
+            ctx = unet.get("context_dim", 0)
+
+            if image_model is not None:
+                # ComfyUI uses image_model to dispatch model classes
+                im = str(image_model).lower()
+                if "flux" in im:
+                    family = "flux"
+                elif "sdxl" in im:
+                    family = "sdxl"
+                elif "sd1" in im or "sd15" in im:
+                    family = "sd15"
+                elif "sd2" in im:
+                    family = "sd2"
+                elif "sd3" in im:
+                    family = "sd3"
+                elif "qwen" in im:
+                    family = "qwen"
+                elif "krea" in im:
+                    family = "krea"
+                elif "hidream" in im or "hi_dream" in im or "hidd" in im:
+                    family = "hidream"
+                elif "chroma" in im:
+                    family = "chroma"
+                elif "lumina" in im:
+                    family = "lumina"
+                else:
+                    family = "fm"  # generic flow-matching
+            else:
+                # Fallback to legacy heuristics
+                if adm == 2816:
+                    family = "sdxl"
+                elif ctx == 768:
+                    family = "sd15"
+                elif ctx == 1024:
+                    family = "sd2"
+                elif ctx in (2048, 4096):
+                    family = "flux"
+    except Exception:
+        pass
+
+    # --- Final fallback ---
+    if family == "unknown":
+        if is_edm:
+            family = "edm"
+        elif latent_ch == 16:
+            family = "flux"  # or any 16ch FM model
+        else:
+            family = "fm"
+
+    # Log raw values for debugging (user can verify substring matching)
+    print(f"[DDRK Detect] raw_image_model={image_model!r}, family={family}, "
+          f"guidance_embed={guidance_embed}, is_edm={is_edm}, latent_ch={latent_ch}")
+
+    # --- Architecture-based recommendations (NOT steps/cfg) ---
+    if family in ("sd15", "sd2"):
+        profile.update(
+            scheduler_type="ddrk_edm_karras",
+            flow_shift=3.0,
+            integrator="auto",
+            sde_strength=0.0,
+            sharpness=0.25,
+            saber_fusion=0.20,
+            momentum_beta=0.25,
+            hint="SD1.5/SD2: EDM. Steps/CFG depend on checkpoint (base 20-30 / 7-8). Use turbo/distilled LoRA for 4-8 steps / CFG 1-2.",
+        )
+    elif family == "sdxl":
+        profile.update(
+            scheduler_type="ddrk_edm_karras",
+            flow_shift=3.0,
+            integrator="auto",
+            sde_strength=0.0,
+            sharpness=0.25,
+            saber_fusion=0.20,
+            momentum_beta=0.20,
+            hint="SDXL: EDM. Steps/CFG depend on checkpoint (base 20-30 / 7-8). Use turbo/distilled for 4-8 steps / CFG 1-2.",
+        )
+    elif family in ("flux", "sd3", "qwen", "krea", "hidream", "chroma", "lumina"):
+        profile.update(
+            scheduler_type="ddrk_auto",
+            flow_shift=1.0,
+            integrator="euler",
+            sde_strength=0.0,
+            sharpness=0.10,
+            saber_fusion=0.0,
+            momentum_beta=0.0,
+            hint=(f"{family.upper()}: Flow Matching. Steps/CFG vary wildly by checkpoint. "
+                  f"{'Guidance embed detected — distilled variant, try CFG≈1.0, steps 4-8. ' if guidance_embed else ''}"
+                  f"Check your model card."),
+        )
+    elif family == "fm":
+        profile.update(
+            scheduler_type="ddrk_auto",
+            flow_shift=1.5,
+            integrator="euler",
+            sde_strength=0.0,
+            sharpness=0.12,
+            saber_fusion=0.0,
+            momentum_beta=0.0,
+            hint=(f"Generic FM: Steps/CFG vary by checkpoint. Start with 8-20 steps, CFG 1-4. "
+                  f"{'Guidance embed detected — distilled variant, try CFG≈1.0. ' if guidance_embed else ''}"
+                  f"Check model card."),
+        )
+    elif family == "edm":
+        profile.update(
+            scheduler_type="ddrk_edm_karras",
+            flow_shift=3.0,
+            integrator="auto",
+            sde_strength=0.0,
+            sharpness=0.25,
+            saber_fusion=0.20,
+            momentum_beta=0.20,
+            hint="Generic EDM: Steps/CFG depend on checkpoint (base 20-30 / 7-8). Use turbo/distilled for fewer steps / lower CFG.",
+        )
+
+    profile["family"] = family
+    profile["guidance_embed"] = guidance_embed
+    return profile
 
 
 # =========================================================
@@ -59,7 +235,6 @@ def _detect_family(sigma_max: float) -> str:
 def dynamic_threshold(denoised: torch.Tensor, sigma: float, sigma_max: float,
                       percentile: float = 0.995, min_val: float = 1.0,
                       edm_ratio: float = 0.30) -> torch.Tensor:
-
     threshold_ratio = 0.40 if sigma_max <= 5.0 else edm_ratio
     if sigma > threshold_ratio * sigma_max or denoised.numel() == 0:
         return denoised
@@ -79,7 +254,6 @@ def dynamic_threshold(denoised: torch.Tensor, sigma: float, sigma_max: float,
 
 
 def _soft_clamp(t: torch.Tensor, bound: float = 5.0, softness: float = 0.25) -> torch.Tensor:
-
     core = torch.clamp(t, -bound, bound)
     excess = t - core
     return core + softness * excess
@@ -446,7 +620,7 @@ class AdaptivePhaseRouter:
                 elif self.is_edm:
                     return "heun"
                 else:
-                    return "heun"  
+                    return "heun"
             elif phase == 2:
                 return "heun" if self.total_steps >= 8 else "euler"
             else:
@@ -493,9 +667,22 @@ def _flow_shift(t: torch.Tensor, shift: float) -> torch.Tensor:
 def get_ddrk_sigmas(scheduler_type: str, steps: int, sigma_min: float,
                     sigma_max: float, device: torch.device,
                     flow_shift: float = 3.0, warmup_steps: int = 0,
-                    beta_a: float = 2.0, beta_b: float = 5.0) -> torch.Tensor:
+                    beta_a: float = 2.0, beta_b: float = 5.0,
+                    auto_optimize: bool = True) -> torch.Tensor:
+    is_edm = sigma_max > 5.0
+
     if scheduler_type == "ddrk_auto":
-        scheduler_type = "ddrk_edm_karras" if sigma_max > 5.0 else "ddrk_cosine"
+        if is_edm:
+            scheduler_type = "ddrk_edm_karras"
+        else:
+            if auto_optimize and steps <= 10:
+                scheduler_type = "ddrk_flow_linear"
+                flow_shift = min(flow_shift, 1.0)
+            elif auto_optimize and steps <= 20:
+                scheduler_type = "ddrk_cosine"
+                flow_shift = min(flow_shift, 2.0)
+            else:
+                scheduler_type = "ddrk_cosine"
 
     if scheduler_type.startswith("ddrk_") and scheduler_type not in (
         "ddrk_edm_karras", "ddrk_edm_simple", "ddrk_edm_poly"
@@ -593,6 +780,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     s_tmin = kwargs.get("s_tmin", 0.0)
     s_tmax = float('inf')
     s_noise = kwargs.get("s_noise", 1.0)
+    auto_optimize = kwargs.get("auto_optimize", True)
 
     work_device = comfy.model_management.get_torch_device()
     work_dtype = x.dtype
@@ -606,6 +794,25 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
 
     sigma_max = float(sigmas.max())
     is_edm = sigma_max > 5.0
+
+    if auto_optimize and not is_edm:
+        if total_steps <= 10:
+            saber_fusion = 0.0
+            sde_strength = 0.0
+            momentum_beta = 0.0
+            sharpness = min(sharpness, 0.12)
+            if integrator == "auto":
+                integrator = "euler"
+            print(f"[DDRK Auto] FM few-step ({total_steps} steps): "
+                  f"SABER=0, SDE=0, momentum=0, sharp={sharpness:.2f}, "
+                  f"integrator={integrator}, scheduler=linear, shift<=1.0")
+        elif total_steps <= 20:
+            saber_fusion = min(saber_fusion, 0.05)
+            sde_strength = 0.0
+            momentum_beta = min(momentum_beta, 0.10)
+            sharpness = min(sharpness, 0.15)
+            print(f"[DDRK Auto] FM mid-step ({total_steps} steps): "
+                  f"SABER<=0.05, SDE=0, momentum<=0.10, sharp<=0.15")
 
     if total_steps <= 6:
         integrator = "euler"
@@ -707,10 +914,11 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             if i == total_steps - 1 and sharpness > 0:
                 x_next = perceptual_sharpen(x_next, sharpness, is_final_step=True)
 
+        # Soft clamp: EDM benefits from it (Karras recommendation), FM does not.
+        # FM latents rely on fine-grained extremes for texture chaos (fur, hair, water).
+        # Stock KSampler never clamps between steps — we match that for FM.
         if is_edm:
             x_next = _soft_clamp(x_next, bound=5.0, softness=0.25)
-        else:
-            x_next = _soft_clamp(x_next, bound=4.0, softness=0.15)
 
         if preview_denoised is not None and state.prev_denoised is not None:
             with torch.no_grad():
@@ -764,6 +972,10 @@ class DDRKOmegaSchedulerNode:
                 ], {"default": "ddrk_auto"}),
                 "flow_shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 10.0, "step": 0.1}),
                 "warmup_steps": ("INT", {"default": 0, "min": 0, "max": 5}),
+                "auto_optimize": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Auto-select scheduler & flow_shift for FM few-step. Disable for full manual control."
+                }),
             }
         }
 
@@ -771,14 +983,15 @@ class DDRKOmegaSchedulerNode:
     FUNCTION = "get_sigmas"
     CATEGORY = "sampling/custom_schedulers"
 
-    def get_sigmas(self, model, steps, scheduler_type, flow_shift, warmup_steps):
+    def get_sigmas(self, model, steps, scheduler_type, flow_shift, warmup_steps, auto_optimize):
         ms = model.get_model_object("model_sampling")
         sigma_min = float(ms.sigma_min)
         sigma_max = float(ms.sigma_max)
         device = ms.sigma_min.device
         sigmas = get_ddrk_sigmas(
             scheduler_type, steps, sigma_min, sigma_max,
-            device=device, flow_shift=flow_shift, warmup_steps=warmup_steps
+            device=device, flow_shift=flow_shift, warmup_steps=warmup_steps,
+            auto_optimize=auto_optimize
         )
         return (sigmas,)
 
@@ -825,7 +1038,7 @@ class DDRKOmegaSamplerNode:
                 }),
                 "s_churn": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 100.0, "step": 1.0,
-                    "tooltip": "EDM churn (Karras Alg 2). 0 = off. Try 5-15 for SDXL."
+                    "tooltip": "EDM churn (Karras Alg 2). 0 = off. Try 5-15 for SDXL. EDM models only; silently ignored for Flow Matching."
                 }),
                 "s_noise": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
@@ -834,6 +1047,10 @@ class DDRKOmegaSamplerNode:
                 "content_aware": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Content-aware SABER — edge-gated fusion. Disable for pixel-art/flat styles."
+                }),
+                "auto_optimize": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Auto-disable SABER/SDE/momentum and force euler for FM few-step. Does NOT set steps/cfg."
                 }),
             }
         }
@@ -845,7 +1062,7 @@ class DDRKOmegaSamplerNode:
     def get_sampler(self, integrator, sde_strength, sharpness, saber_fusion,
                     saber_mode, use_ema_saber, ema_decay, dyn_thresh_percentile,
                     cfg_rescale, momentum_beta, sde_seed, s_churn, s_noise,
-                    content_aware):
+                    content_aware, auto_optimize):
         extra = {
             "integrator": integrator,
             "sde_strength": sde_strength,
@@ -861,9 +1078,37 @@ class DDRKOmegaSamplerNode:
             "s_churn": s_churn,
             "s_noise": s_noise,
             "content_aware": content_aware,
+            "auto_optimize": auto_optimize,
         }
         sampler = comfy.samplers.KSAMPLER(sample_ddrk_omega, extra_options=extra)
         return (sampler,)
+
+
+class DDRKOmegaSmartConfigNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", {}),
+                "latent_image": ("LATENT", {}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "BOOLEAN", "STRING", "FLOAT", "STRING",
+                    "FLOAT", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = ("family", "hint", "guidance_embed", "scheduler_type", "flow_shift", "integrator",
+                    "sde_strength", "sharpness", "saber_fusion", "momentum_beta")
+    FUNCTION = "detect"
+    CATEGORY = "sampling/custom_schedulers"
+
+    def detect(self, model, latent_image):
+        profile = _detect_model_profile(model, latent_image.get("samples"))
+        print(f"[DDRK SmartConfig] Detected family: {profile['family'].upper()}")
+        print(f"[DDRK SmartConfig] Hint: {profile['hint']}")
+        return (profile["family"], profile["hint"], profile["guidance_embed"], profile["scheduler_type"],
+                profile["flow_shift"], profile["integrator"],
+                profile["sde_strength"], profile["sharpness"],
+                profile["saber_fusion"], profile["momentum_beta"])
 
 
 class DDRKOmegaUnifiedKSamplerNode:
@@ -888,13 +1133,21 @@ class DDRKOmegaUnifiedKSamplerNode:
                 "integrator": (["auto", "rk4", "heun", "euler"], {"default": "auto"}),
                 "sde_strength": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.5, "step": 0.01}),
                 "sharpness": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.5, "step": 0.01}),
-                "warmup_steps": ("INT", {"default": 0, "min": 0, "max": 5}),
-            },
-            "optional": {
                 "saber_fusion": ("FLOAT", {
                     "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "forceInput": True,
+                    "tooltip": "Stabilization blur. 0 = disabled. Disable for text/graphics."
                 }),
+                "warmup_steps": ("INT", {"default": 0, "min": 0, "max": 5}),
+                "auto_optimize": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Auto-disable SABER/SDE/momentum and force euler for FM few-step. Does NOT set steps/cfg."
+                }),
+                "smart_defaults": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Auto-detect architecture and set scheduler/integrator/shift/saber/sharpness only. Steps/CFG are checkpoint-specific and must be tuned manually."
+                }),
+            },
+            "optional": {
                 "saber_mode": (["auto", "image", "video"], {"default": "auto"}),
                 "use_ema_saber": ("BOOLEAN", {"default": True}),
                 "ema_decay": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 0.99, "step": 0.01}),
@@ -904,7 +1157,7 @@ class DDRKOmegaUnifiedKSamplerNode:
                 "sde_seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "s_churn": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 100.0, "step": 1.0,
-                    "tooltip": "EDM churn (Karras Alg 2). 0 = off. Try 5-15 for SDXL."
+                    "tooltip": "EDM churn (Karras Alg 2). 0 = off. Try 5-15 for SDXL. EDM models only; silently ignored for Flow Matching."
                 }),
                 "s_noise": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
@@ -923,30 +1176,58 @@ class DDRKOmegaUnifiedKSamplerNode:
 
     def sample(self, model, positive, negative, latent_image, seed, steps, cfg,
                denoise, scheduler_type, flow_shift, integrator, sde_strength,
-               sharpness, warmup_steps, saber_fusion=0.30, saber_mode="auto",
-               use_ema_saber=True, ema_decay=0.7, dyn_thresh_percentile=0.995,
-               cfg_rescale=0.0, momentum_beta=0.25, sde_seed=-1,
-               s_churn=0.0, s_noise=1.0, content_aware=True):
-        latent = latent_image["samples"]
-        noise_mask = latent_image.get("noise_mask", None)
+               sharpness, warmup_steps, auto_optimize, smart_defaults,
+               saber_fusion=0.30, saber_mode="auto", use_ema_saber=True,
+               ema_decay=0.7, dyn_thresh_percentile=0.995, cfg_rescale=0.0,
+               momentum_beta=0.25, sde_seed=-1, s_churn=0.0, s_noise=1.0,
+               content_aware=True):
+        # Keep the full latent dict to preserve metadata (noise_mask, etc.)
+        latent = latent_image.copy()
+        latent_samples = latent["samples"]
+        noise_mask = latent.get("noise_mask", None)
+
+        # Fix channel mismatch (matches stock KSampler / SamplerCustom path)
+        latent_samples = comfy.sample.fix_empty_latent_channels(model, latent_samples)
+
+        # Smart Defaults override — architecture only, NOT steps/cfg
+        # Steps and CFG are checkpoint properties (training, LoRA, distillation).
+        # They cannot be inferred from topology. Use your model card or manual tuning.
+        if smart_defaults:
+            profile = _detect_model_profile(model, latent_samples)
+            scheduler_type = profile["scheduler_type"]
+            flow_shift = profile["flow_shift"]
+            integrator = profile["integrator"]
+            sde_strength = profile["sde_strength"]
+            sharpness = profile["sharpness"]
+            saber_fusion = profile["saber_fusion"]
+            momentum_beta = profile["momentum_beta"]
+            print(f"[DDRK Smart] {profile['family'].upper()} detected: "
+                  f"scheduler={scheduler_type}, shift={flow_shift}, integrator={integrator}")
+            print(f"[DDRK Smart] Hint: {profile['hint']}")
+
+        # Match ComfyUI KSampler denoise logic: recalc total steps BEFORE sigmas
+        steps_denoised = steps
+        if denoise < 1.0:
+            steps = max(1, int(steps / denoise))
 
         ms = model.get_model_object("model_sampling")
         sigma_min = float(ms.sigma_min)
         sigma_max = float(ms.sigma_max)
-        device = comfy.model_management.get_torch_device()
+        device = ms.sigma_min.device  # consistent with SchedulerNode
 
         sigmas = get_ddrk_sigmas(
             scheduler_type, steps, sigma_min, sigma_max,
-            device=device, flow_shift=flow_shift, warmup_steps=warmup_steps
+            device=device, flow_shift=flow_shift, warmup_steps=warmup_steps,
+            auto_optimize=auto_optimize
         )
 
-        if denoise < 1.0:
-            steps_denoised = max(1, int(steps * denoise))
-            sigmas = sigmas[-(steps_denoised + 1):]
+        noise = comfy.sample.prepare_noise(latent_samples, seed, None)
 
-        noise = comfy.sample.prepare_noise(latent, seed, None)
         if denoise < 1.0:
-            latent = latent + noise * sigmas[0]
+            sigmas = sigmas[-(steps_denoised + 1):]
+            # Do NOT manually scale latent_samples here — KSampler.sample()
+            # internally calls model_sampling.noise_scaling(sigmas[0], noise, latent_image)
+            # which already mixes noise and latent correctly.
 
         extra = {
             "integrator": integrator,
@@ -963,15 +1244,26 @@ class DDRKOmegaUnifiedKSamplerNode:
             "s_churn": s_churn,
             "s_noise": s_noise,
             "content_aware": content_aware,
+            "auto_optimize": auto_optimize,
         }
         sampler_obj = comfy.samplers.KSAMPLER(sample_ddrk_omega, extra_options=extra)
 
+        # Live preview — graceful fallback for older ComfyUI builds
+        try:
+            import comfy.latent_preview as lp
+            callback = lp.prepare_callback(model, steps)
+        except Exception:
+            callback = None
+
         samples = comfy.sample.sample_custom(
             model, noise, cfg, sampler_obj, sigmas, positive, negative,
-            latent_image=latent, noise_mask=noise_mask,
-            callback=None, disable_pbar=False, seed=seed
+            latent_image=latent_samples, noise_mask=noise_mask,
+            callback=callback, disable_pbar=False, seed=seed
         )
-        return ({"samples": samples},)
+
+        out = latent.copy()
+        out["samples"] = samples
+        return (out,)
 
 
 # =========================================================
@@ -982,10 +1274,12 @@ NODE_CLASS_MAPPINGS = {
     "DDRKOmegaSchedulerNode": DDRKOmegaSchedulerNode,
     "DDRKOmegaSamplerNode": DDRKOmegaSamplerNode,
     "DDRKOmegaUnifiedKSamplerNode": DDRKOmegaUnifiedKSamplerNode,
+    "DDRKOmegaSmartConfigNode": DDRKOmegaSmartConfigNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DDRKOmegaSchedulerNode": "DDRK Omega Scheduler",
     "DDRKOmegaSamplerNode": "DDRK Omega Sampler",
     "DDRKOmegaUnifiedKSamplerNode": "DDRK Omega Unified KSampler",
+    "DDRKOmegaSmartConfigNode": "DDRK Omega Smart Config",
 }
