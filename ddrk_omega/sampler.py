@@ -1,11 +1,13 @@
 """
 ================================================================================
-DDRK Omega Sampler — v1.5
+DDRK Omega Sampler — v1.5.0
 ComfyUI | Flow Matching + EDM Universal Sampler
 
-Domain-adaptive diffusion sampler with adaptive phase routing, momentum
-integrators, content-aware SABER stabilization, perceptual sharpening,
-dynamic thresholding, and universal scheduler support.
+v1.5.0: Removed per-step soft_clamp for FM models — fixes "plastic fur/hair".
+      EDM still clamped per Karras. guidance_embed hints, debug logging.
+      Auto-Optimize for FM few-step (≤10 steps): disables SABER/SDE/momentum,
+      forces euler + linear scheduler. SmartConfig node for debugging.
+      Fixed UnifiedKSamplerNode denoise/latent handling to match ComfyUI KSampler.
 ================================================================================
 """
 
