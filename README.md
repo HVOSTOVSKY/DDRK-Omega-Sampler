@@ -6,7 +6,7 @@
 ### **D**omain-adaptive **D**iffusion **R**obust **K**ernel
 
 > A production-ready universal sampler for **ComfyUI**.  
-> Flow Matching · EDM · Adaptive Phase Routing · Momentum Denoising · Perceptual Sharpening
+> Flow Matching · EDM · Adaptive Phase Routing · Momentum Denoising · Perceptual Sharpening · Architecture Auto-Detection
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-blue)](https://github.com/comfyanonymous/ComfyUI)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
@@ -16,7 +16,7 @@
 
 ## What does DDRK stand for?
 
-**D**omain-adaptive — automatically detects Flow Matching (Anima/Flux/SD3/Krea) vs EDM (SDXL/SD1.5/Illugen) and recalibrates all internal parameters (schedules, integrators, SDE, sharpening, stabilization) on the fly.
+**D**omain-adaptive — automatically detects Flow Matching (Anima/Flux/SD3/Krea/Qwen/HiDream/Chroma/Lumina) vs EDM (SDXL/SD1.5) and recalibrates all internal parameters (schedules, integrators, SDE, sharpening, stabilization) on the fly.
 
 **D**iffusion — obviously, this is a diffusion sampler.
 
@@ -36,12 +36,15 @@ DDRK Omega solves both problems:
 |---------|--------------|
 | FM vs EDM incompatibility | Auto-detection by `sigma_max` + domain-specific calibration |
 | RK4 is too slow (4× model calls) | Adaptive order: RK4 only when beneficial, Heun/Euler otherwise |
+| Plastic / smeared fur or hair on FM | Per-step soft clamp removed for FM — preserves natural texture chaos |
+| Wrong parameters for distilled/turbo LoRAs | `guidance_embed` detection + hint text warns about CFG≈1 variants |
 | Oscillation / grain in textures | Velocity EMA (momentum) on final direction vector only |
 | Color burn on EDM high CFG | Dynamic thresholding + std-matching CFG rescale (phi-blend — restores contrast instead of clamping) |
 | Plastic / smeared look on photorealistic FM | Content-aware SABER — edge-gated fusion scales blur per-pixel; SABER fades in on Phase 2 |
 | Video frame flickering | SABER 2.0 with temporal EMA + chaos metric |
 | Over-sharpening noisy regions | Multi-scale perceptual sharpen with inverted entropy gate (3×3 texture + 5×5 structure, sharpens edges/textures, protects flat walls) |
 | Memory leaks in long sessions | LRU-bounded caches for kernels and SABER buffers |
+| Inpainting / img2img denoise bugs | `fix_empty_latent_channels` + correct `denoise<1.0` sigma handling matches stock KSampler |
 
 ---
 
@@ -50,19 +53,19 @@ DDRK Omega solves both problems:
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  PHASE 1  (~55-65% steps)  │  Adaptive-order integrator + SDE     │
-│                            │  RK4/Heun/Euler by trajectory      │
-│                            │  curvature; EDM churn (Karras)     │
+│                            │  RK4/Heun/Euler by trajectory        │
+│                            │  curvature; EDM churn (Karras)       │
 │                            │  SDE: entropy-gated + quadratic mask │
 ├─────────────────────────────────────────────────────────────────────┤
-│  PHASE 2  (~25-35% steps)  │  Euler + conditional stabilization │
+│  PHASE 2  (~25-35% steps)  │  Euler + conditional stabilization   │
 │                            │  EDM: SABER OFF (mid-step blur       │
 │                            │  causes anatomical shifts)           │
-│                            │  FM images: content-aware SABER    │
+│                            │  FM images: content-aware SABER      │
 │                            │  (edge-gated fusion, fades in)       │
 │                            │  FM video (5D): SABER temporal EMA   │
 ├─────────────────────────────────────────────────────────────────────┤
 │  PHASE 3  (~10% steps)     │  Euler + final sharpening            │
-│                            │  Multi-scale unsharp (3×3+5×5)     │
+│                            │  Multi-scale unsharp (3×3+5×5)       │
 │                            │  Phase-fade: sharpness ramps in      │
 │                            │  over 1–2 steps, no hard switch      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -75,9 +78,11 @@ DDRK Omega solves both problems:
 - **Sigma-adaptive SDE.** Noise scales as `√dt · σ^0.25`, applied only to truly flat regions (`(1−edge)² × entropy`) to avoid boundary artifacts and grain in mid-tones.
 - **EDM churn (Karras Algorithm 2).** Classic stochastic injection for EDM models at high-sigma steps — compensates discretization error and boosts micro-detail on SDXL/SD1.5.
 - **Multi-scale sharpening.** Perceptual unsharp mask uses both 3×3 (fine texture) and 5×5 (mid-frequency structure) kernels — sharpens without halo artifacts.
-- **Photo-aware FM path.** Flow Matching models (Krea, Anima, etc.) get auto-capped SABER (`≤0.15`), reduced momentum (`≤0.15`), and SDE gated by local entropy to prevent plastic skin and sand-like noise.
+- **FM soft clamp removed.** Stock KSampler never clamps between steps. We match that for Flow Matching to preserve natural texture (fur, hair, water). EDM still clamped per Karras.
+- **Photo-aware FM path.** Flow Matching models get auto-capped SABER (`≤0.15`), reduced momentum (`≤0.15`), and SDE gated by local entropy to prevent plastic skin and sand-like noise.
 - **Universal dynamic thresholding.** Imagen-style clamping is active for both EDM and FM whenever `dyn_thresh_percentile < 1.0`, preventing CFG blowouts across all architectures.
 - **True Karras schedule.** `ρ = 7` polynomial schedule for EDM, not a simple exponential masquerading as Karras.
+- **Architecture introspection.** Detects model family via `unet_config["image_model"]` — Flux, SD3, Qwen, Krea, HiDream, Chroma, Lumina, SDXL, SD1.5, SD2.
 
 ---
 
@@ -106,6 +111,7 @@ Generates sigma schedules. Auto-detects model family and picks the optimal curve
 | `ddrk_anima` | Flow Matching — with optional warmup |
 | `ddrk_fewstep` | Flow Matching — 4-8 steps, aggressive shift |
 | `ddrk_flow_cosmos` | Flow Matching — cosmos-style tail adjustment |
+| `ddrk_flow_linear` | Flow Matching — linear with shift |
 | `ddrk_edm_karras` | EDM — true Karras (ρ=7) |
 | `ddrk_edm_poly` | EDM — polynomial tail |
 | `ddrk_edm_simple` | EDM — pure exponential |
@@ -128,45 +134,54 @@ The sampler engine. Connect to a `SamplerCustom` or use standalone.
 - `s_churn`: EDM churn strength (Karras Algorithm 2). Injects noise at high-sigma steps to compensate discretization error. 0 = off. Try 5–15 for SDXL detail boost.
 - `s_noise`: EDM churn noise multiplier. 1.0 = standard Karras noise scaling.
 - `content_aware`: Content-aware SABER fusion — edge-gated blur that preserves detail. Default True. Disable for pixel-art, flat-shading, or heavily stylized LoRAs where edge detection aliases against the pattern frequency.
+- `auto_optimize`: Auto-disable SABER/SDE/momentum and force euler for FM few-step (≤10 steps). Does NOT set steps/cfg.
 
 ### 3. DDRK Omega Unified KSampler
 All-in-one node. Drop-in replacement for ComfyUI's native KSampler.
+
+**Additional features:**
+- `smart_defaults`: Auto-detect architecture and set scheduler/integrator/shift/saber/sharpness. **Steps and CFG are checkpoint-specific** (depend on LoRA, distillation, turbo) and must be tuned manually. Use the hint output from SmartConfigNode as guidance.
+- `saber_fusion`: Now exposed as a regular widget (not hidden forceInput).
+- Live preview support with graceful fallback for older ComfyUI builds.
+- Correct `denoise<1.0` handling matching stock KSampler (no double latent scaling).
+
+### 4. DDRK Omega Smart Config
+Debug / introspection node. Feed it a model + latent and it returns:
+- `family`: detected architecture (flux, sd3, qwen, krea, hidream, chroma, lumina, sdxl, sd15, sd2, edm, fm)
+- `hint`: human-readable recommendation for steps/cfg ranges
+- `guidance_embed`: Boolean — True if the model has built-in guidance (usually distilled variants, CFG≈1)
+- `scheduler_type`, `flow_shift`, `integrator`, `sde_strength`, `sharpness`, `saber_fusion`, `momentum_beta`: recommended sampler settings
+
+> **Note:** SmartConfig does **not** guess steps or CFG. Those depend on training recipe, LoRA, and distillation — not on topology. Always check your model card.
 
 ---
 
 ## Recommended Settings
 
-### Anima / Flux / SD3 — Arts & Stylized (Flow Matching)
+### General rule of thumb
+- **For texture-heavy content** (fur, hair, water, fabric): `integrator=euler`, `saber_fusion=0`, `momentum_beta=0`, `sde_strength=0`
+- **For smooth / stylized art**: `integrator=auto`, `saber_fusion=0.15–0.30`, `sde_strength=0.04–0.08`
+- **For text / UI / graphics**: `integrator=euler`, `saber_fusion=0`, `sde_strength=0`, `sharpness=0.40+`
+- **Distilled / turbo / CFG≈1 models**: check `guidance_embed` via SmartConfigNode — if True, start with CFG 1.0 and 4-8 steps
+
+### Anima / Flux / SD3 / Krea / Qwen / HiDream / Chroma / Lumina — Arts & Stylized (Flow Matching)
 | Parameter | Value |
 |-----------|-------|
-| Steps | 20–30 |
+| Steps | 8–20 (checkpoint-dependent; turbo LoRA = 4-8, base = 20-50) |
+| CFG | 1.0–4.0 (checkpoint-dependent; distilled = 1.0, dev = 3.5–4.0) |
 | Scheduler | `ddrk_auto` or `ddrk_cosine` |
-| Flow shift | 3.0 |
-| Integrator | `auto` |
-| SDE strength | 0.06–0.08 |
-| Sharpness | 0.30 |
-| SABER fusion | 0.15–0.30 |
-| Momentum beta | 0.15–0.25 |
-
-### Krea / Photorealistic FM Models (Flow Matching)
-| Parameter | Value |
-|-----------|-------|
-| Steps | 20–28 |
-| Scheduler | `ddrk_auto` or `ddrk_cosine` |
-| Flow shift | 3.0 |
-| Integrator | `auto` (forces `heun` on FM) |
-| SDE strength | 0.02–0.04 |
-| Sharpness | 0.25–0.35 |
-| SABER fusion | 0.10–0.15 |
-| Momentum beta | 0.10–0.15 |
-| Dyn threshold | 0.995 |
-
-> **Why lower values?** Photo-realistic FM models build micro-texture (skin pores, fabric weave) during Phase 2. High SABER or momentum smears this into a plastic look. The v1.4.3 engine auto-caps these internally, but setting them low manually gives the cleanest result.
+| Flow shift | 1.0 |
+| Integrator | `euler` for texture; `auto` for smooth art |
+| SDE strength | 0.00–0.04 (photo) / 0.04–0.08 (art) |
+| Sharpness | 0.20–0.30 |
+| SABER fusion | 0.00–0.15 (photo) / 0.15–0.30 (art) |
+| Momentum beta | 0.00–0.15 |
 
 ### SDXL / SD1.5 (EDM)
 | Parameter | Value |
 |-----------|-------|
-| Steps | 25–40 |
+| Steps | 20–30 |
+| CFG | 7.0–8.0 (base); 1.0–2.0 (turbo/distilled) |
 | Scheduler | `ddrk_auto` or `ddrk_edm_karras` |
 | Integrator | `auto` (will force Heun) |
 | SDE strength | 0.00 (ignored automatically) |
@@ -183,14 +198,17 @@ All-in-one node. Drop-in replacement for ComfyUI's native KSampler.
 | SABER fusion | 0.35–0.50 |
 | EMA decay | 0.7 |
 
-### Few-step / LCM-like
+### Few-step / LCM-like / Turbo
 | Parameter | Value |
 |-----------|-------|
-| Steps | 4–6 |
-| Scheduler | `ddrk_fewstep` |
+| Steps | 4–8 |
+| CFG | 1.0 (distilled) |
+| Scheduler | `ddrk_auto` or `ddrk_fewstep` |
 | Integrator | `euler` (auto-forced) |
-| Sharpness | 0.10 |
-| SABER fusion | 0.10 |
+| Sharpness | 0.10–0.15 |
+| SABER fusion | 0.00 |
+| Momentum beta | 0.00 |
+| auto_optimize | True |
 
 ---
 
@@ -204,31 +222,25 @@ All-in-one node. Drop-in replacement for ComfyUI's native KSampler.
 | **v1.3** | Fixed SABER2 crash on 5D latents with `F=1` (single-frame video format). Reflect-pad safety for `avg_pool3d`. |
 | **v1.4** | EDM path fixes — less blur, less clamp-aggression, more accurate steps. |
 | **v1.4.1** | Adaptive Balance. Soft variance clamp, adaptive DT skip, SABER for EDM only on extreme early noise. |
-| **v1.4.3** | **Consolidated Quality & Audit Pass.** Fixes + new features. Bugfixes: `denoise_mask`→`noise_mask`, `denoise<1.0` sigma injection, EDM schedulers reach `σ=0`, integrator honored in all phases, `momentum_beta` threaded, inverted entropy mask in sharpen, router guard `steps≤2`, warmup monotonicity, smooth `flow_cosmos`, SABER2 image gate, EDM off-by-one, universal dyn thresholding, FM auto-caps, Phase 1 Heun for FM 7–9 steps, adaptive order curvature placeholder, phase fade start offset. New features: EDM churn (Karras Alg 2), multi-scale sharpen (3×3+5×5), std-matching CFG rescale, adaptive order by trajectory curvature, phase-boundary fade (1–2 step blend), content-aware SABER (multi-scale edge-gated fusion, UI-toggleable). |
+| **v1.4.3** | Consolidated Quality & Audit Pass. EDM churn, multi-scale sharpen, std-matching CFG rescale, adaptive order by curvature, phase-boundary fade, content-aware SABER. |
+| **v1.5** | **Architecture Introspection & Quality Hardening.** SmartConfigNode with `image_model` detection (Flux/SD3/Qwen/Krea/HiDream/Chroma/Lumina/SDXL/SD15/SD2), `guidance_embed` signal for distilled variants, `auto_optimize` for FM few-step, `smart_defaults` for one-click architecture setup. Fixed `fix_empty_latent_channels` compatibility, corrected `denoise<1.0` double-scaling bug, unified device source, live preview support, removed per-step soft clamp for FM (fixes plastic fur/hair), exposed `saber_fusion` as regular widget. |
 
 ---
 
 ## Credits & Provenance
 
-This project has an unusual but fully transparent development lineage:
-
 1. **Original concept & prototype (v1.0)**  
    Created by **HVOSTOVSKY** — the core idea of a hybrid phase-based sampler with high-order integrators, SDE noise masking, and SABER temporal stabilization.
 
-2. **Local AI agent audit loop**  
-   The codebase was iteratively reviewed by a local AI assistant, catching architectural inconsistencies and proposing mathematical improvements (adaptive order, sigma-aware schedules, FM/EDM branching).
-
-3. **Production hardening (v1.1–v1.3)**  
-   Final multi-pass static analysis, mathematical verification of integrator correctness, and edge-case hardening were performed by **Kimi** (Moonshot AI). This included:
+2. **Production hardening (v1.1–v1.5)**  
+   Iterative development and multi-pass audits by **Kimi** (Moonshot AI). This included:
    - Mathematical audit: removal of invalid FSAL-RK4 caching, correct momentum application (final-direction only)
    - Schedule correctness: true Karras ρ=7, guaranteed `0.0` terminators for all FM curves
    - Tensor safety: correct 5D↔4D reshape ordering, `F=1` reflect-pad crash fix
    - Memory safety: LRU-bounded caches for LoG kernels and SABER buffers
-   - API compliance: full ComfyUI `denoise<1.0`, `noise_mask`, and dtype contract adherence
-
-4. **Photo-realism tuning & logic audit (v1.4.3)**  
-   Quality analysis and FM photo-specific calibration. Implemented entropy-gated SDE, soft clamp for FM, adaptive sharpness capping, multi-scale sharpening, EDM churn, std-matching CFG rescale, phase-boundary fade, adaptive order by curvature, and content-aware SABER.  
-   External static-analysis audits (two passes) caught 15+ logic errors: API typos, EDM missing `σ=0`, hardcoded Euler, inverted entropy mask, broken momentum threading, off-by-one steps, universal dyn thresholding, missing FM auto-caps, Phase 1 gap for 7–9 steps.
+   - API compliance: full ComfyUI `denoise<1.0`, `noise_mask`, `fix_empty_latent_channels`, and dtype contract adherence
+   - Architecture introspection: `image_model` / `guidance_embed` detection via `model.model.model_config`
+   - Quality tuning: FM clamp removal, auto_optimize, smart_defaults
 
 ---
 
@@ -238,14 +250,15 @@ This project has an unusual but fully transparent development lineage:
 - **Video mode requires 5D latents.** Standard AnimateDiff output works; single-frame 5D tensors (`[B,C,1,H,W]`) are handled but offer no temporal benefit.
 - **Few-step (≤6) forces Euler.** High-order integrators need step budget to show advantage.
 - **No built-in TeaCache / caching.** Each model call is fresh; speedups require external acceleration nodes.
-- **FM photorealism vs art trade-off.** The v1.4.3 photo path auto-caps stabilization on FM images while preserving structure. If you generate heavily stylized FM art and see noise in flat color regions, manually raise `saber_fusion` to 0.20–0.30.
+- **Steps and CFG are not auto-detected.** They depend on checkpoint training, LoRA, and distillation. SmartConfigNode gives hints, but you must tune manually.
+- **FM photorealism vs art trade-off.** The auto_optimize path auto-caps stabilization on FM images while preserving structure. If you generate heavily stylized FM art and see noise in flat color regions, manually raise `saber_fusion` to 0.20–0.30.
 
 ---
 
 ## Issues
 
 Found a bug? Open an [Issue](https://github.com/HVOSTOVSKY/DDRK-Omega-Sampler/issues) with:
-- Model name (Anima / Flux / SDXL / Krea / etc.)
+- Model name (Anima / Flux / SDXL / Krea / Qwen / HiDream / etc.)
 - Steps and settings
 - Error traceback (if crash) or comparison images (if quality issue)
 
