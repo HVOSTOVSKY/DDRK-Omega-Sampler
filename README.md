@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ddrk_logo.png" width="400" alt="DDRK Omega Logo">
+  <img src="logo.png" width="400" alt="DDRK Omega Logo">
 </p>
 
 # DDRK Omega Sampler
