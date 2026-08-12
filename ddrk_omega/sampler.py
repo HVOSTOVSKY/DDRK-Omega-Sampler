@@ -914,13 +914,14 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             if saber_mode in ("video", "auto") and x_next.dim() == 5 and x_next.shape[2] > 1:
                 x_next = saber.fuse(x_next)
             if i == total_steps - 1 and sharpness > 0:
-                x_next = perceptual_sharpen(x_next, sharpness, is_final_step=True)
+                if not is_edm:  # <-- добавить проверку
+                    x_next = perceptual_sharpen(x_next, sharpness, is_final_step=True)
 
         # Soft clamp: EDM benefits from it (Karras recommendation), FM does not.
         # FM latents rely on fine-grained extremes for texture chaos (fur, hair, water).
         # Stock KSampler never clamps between steps — we match that for FM.
         if is_edm:
-            x_next = _soft_clamp(x_next, bound=5.0, softness=0.25)
+            x_next = _soft_clamp(x_next, bound=10.0, softness=0.8)
 
         if preview_denoised is not None and state.prev_denoised is not None:
             with torch.no_grad():
@@ -938,11 +939,10 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
 
         if callback is not None:
             callback({
-                'x': x,
-                'i': i,
-                'sigma': sigma_curr,
-                'sigma_next': sigma_next,
-                'denoised': preview_denoised,
+            "x": x,
+            "i": i,
+            "sigma": sigma_curr,
+            "denoised": preview_denoised,
             })
 
     x = torch.clamp(x, -7.0, 7.0)
@@ -1215,7 +1215,7 @@ class DDRKOmegaUnifiedKSamplerNode:
         ms = model.get_model_object("model_sampling")
         sigma_min = float(ms.sigma_min)
         sigma_max = float(ms.sigma_max)
-        device = ms.sigma_min.device  # consistent with SchedulerNode
+        device = ms.sigma_min.device
 
         sigmas = get_ddrk_sigmas(
             scheduler_type, steps, sigma_min, sigma_max,
@@ -1227,9 +1227,19 @@ class DDRKOmegaUnifiedKSamplerNode:
 
         if denoise < 1.0:
             sigmas = sigmas[-(steps_denoised + 1):]
-            # Do NOT manually scale latent_samples here — KSampler.sample()
-            # internally calls model_sampling.noise_scaling(sigmas[0], noise, latent_image)
-            # which already mixes noise and latent correctly.
+
+        # --- FIX: correct import path + correct step count for ProgressBar ---
+        actual_steps = len(sigmas) - 1
+        callback = None
+        try:
+            import latent_preview
+            callback = latent_preview.prepare_callback(model, actual_steps)
+        except Exception:
+            try:
+                import comfy.latent_preview as lp
+                callback = lp.prepare_callback(model, actual_steps)
+            except Exception as e:
+                print(f"[DDRK] Preview callback failed: {e}")
 
         extra = {
             "integrator": integrator,
@@ -1249,13 +1259,6 @@ class DDRKOmegaUnifiedKSamplerNode:
             "auto_optimize": auto_optimize,
         }
         sampler_obj = comfy.samplers.KSAMPLER(sample_ddrk_omega, extra_options=extra)
-
-        # Live preview — graceful fallback for older ComfyUI builds
-        try:
-            import comfy.latent_preview as lp
-            callback = lp.prepare_callback(model, steps)
-        except Exception:
-            callback = None
 
         samples = comfy.sample.sample_custom(
             model, noise, cfg, sampler_obj, sigmas, positive, negative,
@@ -1285,3 +1288,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DDRKOmegaUnifiedKSamplerNode": "DDRK Omega Unified KSampler",
     "DDRKOmegaSmartConfigNode": "DDRK Omega Smart Config",
 }
+
