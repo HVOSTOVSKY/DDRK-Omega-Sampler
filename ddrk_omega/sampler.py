@@ -36,6 +36,13 @@ class SamplerState:
     is_edm: bool = False
     prev_denoised: Optional[torch.Tensor] = None
     prev_sigma: float = 0.0
+    # Was previously set via dynamic attribute assignment (state.curvature = ...)
+    # which worked but wasn't declared, so it didn't show up in type hints/autocomplete
+    # and looked like a bug on first read. Now a real field.
+    curvature: float = 0.0
+    # Step size of the previous integrator call, needed for the variable-step
+    # Adams-Bashforth-2 derivative extrapolation (see _ab2_extrapolate below).
+    prev_dt: Optional[float] = None
 
 
 class DeviceDtypeGuard:
@@ -242,11 +249,20 @@ def dynamic_threshold(denoised: torch.Tensor, sigma: float, sigma_max: float,
         return denoised
 
     flat = denoised.reshape(denoised.shape[0], -1)
-    max_val = flat.abs().max(dim=1, keepdim=True)[0]
-    if max_val.max().item() < 3.5:
+    abs_flat = flat.abs()
+    max_val = abs_flat.max(dim=1, keepdim=True)[0]
+    # Exact early-out, not an empirical guess: s = clamp(quantile(...), min=min_val)
+    # is always >= min_val. If max_val <= min_val, then for every element,
+    # abs(denoised) <= max_val <= min_val <= s, so ratio = s/abs(denoised) >= 1
+    # everywhere and scale is a no-op identically. The old cutoff (a literal 3.5,
+    # picked for one specific latent scale) skipped this branch even in cases
+    # where max_val sat between min_val and 3.5 — a range where thresholding
+    # *would* have had a real (if small) effect. This condition is provably a
+    # no-op rather than an assumption about typical latent magnitudes, so it's
+    # correct for any model's latent scale, not just the one it was tuned on.
+    if max_val.max().item() <= min_val:
         return denoised
 
-    abs_flat = flat.abs()
     s = torch.quantile(abs_flat, percentile, dim=1, keepdim=True)
     s = torch.clamp(s, min=min_val)
     s = s.reshape(denoised.shape[0], *[1] * (denoised.dim() - 1))
@@ -259,6 +275,33 @@ def _soft_clamp(t: torch.Tensor, bound: float = 5.0, softness: float = 0.25) -> 
     core = torch.clamp(t, -bound, bound)
     excess = t - core
     return core + softness * excess
+
+
+def _zscore_gate(t: torch.Tensor, gain: float = 2.0, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Scale-invariant "is this pixel unusually high vs. its neighborhood" gate.
+
+    Used everywhere this file needs a soft edge/chaos/flatness detector:
+    sigmoid of the z-score (deviation from the tensor's own mean, in units of
+    its own standard deviation), instead of `sigmoid((t - t.mean()) * K)` with
+    a fixed K.
+
+    The fixed-K version has a real correctness gap, not just a style
+    preference: this exact code path runs on both EDM latents (values can
+    range into the tens, scaling with sigma) and Flow Matching latents
+    (typically O(1)). A single constant K tuned to look right on one of those
+    scales is systematically over- or under-steep on the other — on the
+    small-magnitude side the sigmoid barely leaves 0.5 (gate never engages),
+    on the large-magnitude side it saturates to a hard 0/1 step (gate always
+    fully on or off, no soft blending). Dividing by the local std first makes
+    the input to sigmoid dimensionless, so `gain` controls transition
+    sharpness in units of "how many standard deviations above typical" —
+    that number means the same thing regardless of the tensor's absolute
+    scale, so one `gain` is simultaneously well-calibrated for EDM and FM.
+    """
+    std, mean = torch.std_mean(t)
+    z = (t - mean) / std.clamp_min(eps)
+    return torch.sigmoid(z * gain)
 
 
 # =========================================================
@@ -290,9 +333,16 @@ class LoGMask:
         kernel = k.repeat(c, 1, 1, 1)
         lap = F.conv2d(F.pad(x, (1, 1, 1, 1), mode='reflect'), kernel, groups=c)
         edge = lap.abs()
-        emax = edge.max()
-        if emax > 1e-8:
-            edge = edge / emax
+        # Robust scale estimate (mean + 3*std) instead of the raw max. A single
+        # very peaked pixel (near-saturated latent value, a genuine outlier)
+        # otherwise sets the entire normalization denominator by itself,
+        # silently suppressing every other real edge in the same map toward
+        # zero. mean+3*std uses the *distribution* of edge magnitudes rather
+        # than its single most extreme sample, so one outlier no longer
+        # determines the scale for the whole tensor.
+        edge_std, edge_mean = torch.std_mean(edge)
+        norm = (edge_mean + 3.0 * edge_std).clamp_min(1e-8)
+        edge = edge / norm
         mask = (edge > threshold).float()
         mask = F.avg_pool2d(mask, kernel_size=3, stride=1, padding=1)
 
@@ -314,7 +364,7 @@ def local_entropy_mask(x: torch.Tensor, window: int = 3) -> torch.Tensor:
     mu = F.avg_pool2d(x_pad, window, stride=1)
     mu_sq = F.avg_pool2d(x_pad ** 2, window, stride=1)
     var = (mu_sq - mu ** 2).clamp_min(0.0)
-    flatness = 1.0 - torch.sigmoid((var - var.mean()) * 30.0)
+    flatness = 1.0 - _zscore_gate(var)
 
     if is_5d:
         flatness = flatness.view(b, f, c, h, w).permute(0, 2, 1, 3, 4)
@@ -381,7 +431,7 @@ class SABER2:
                 blur5 = F.avg_pool2d(F.pad(x, (2,2,2,2), mode='reflect'), 5, stride=1)
                 edge5 = (x - blur5).abs()
                 combined = (log3 + edge5) * 0.5
-                edge_density = torch.sigmoid((combined - combined.mean()) * 15.0)
+                edge_density = _zscore_gate(combined)
                 fusion_weight = self.fusion * (1.0 - edge_density)
             else:
                 if x.shape[2] == 1:
@@ -392,19 +442,19 @@ class SABER2:
                     blur5 = F.avg_pool2d(F.pad(x_4d, (2,2,2,2), mode='reflect'), 5, stride=1)
                     edge5 = (x_4d - blur5).abs()
                     combined = (log3 + edge5) * 0.5
-                    edge_density = torch.sigmoid((combined - combined.mean()) * 15.0)
+                    edge_density = _zscore_gate(combined)
                     fusion_weight = self.fusion * (1.0 - edge_density)
                     fusion_weight = fusion_weight.unsqueeze(2)
                 else:
                     blur3 = F.avg_pool3d(F.pad(x, (1,1,1,1,1,1), mode='reflect'), 3, stride=1)
                     edge3 = (x - blur3).abs()
-                    edge_density = torch.sigmoid((edge3 - edge3.mean()) * 20.0)
+                    edge_density = _zscore_gate(edge3)
                     fusion_weight = self.fusion * (1.0 - edge_density)
 
         if is_vid:
             stacked = torch.stack(buf["frames"], dim=0)
             var = torch.var(stacked, dim=0)
-            chaos = torch.sigmoid((var - var.mean()) * 10.0)
+            chaos = _zscore_gate(var)
             if self.use_ema:
                 if buf["ema"] is None:
                     buf["ema"] = x.detach().clone()
@@ -487,8 +537,8 @@ def _safe_sigma(s: Union[float, torch.Tensor]) -> float:
 def euler_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta: float = None):
     denoised = model_fn(x, sigma)
     d = (x - denoised) / _safe_sigma(sigma)
-    d = _apply_momentum(d, state, momentum_beta=momentum_beta)
     dt = sigma_next - sigma
+    d = _ab2_extrapolate(d, state, dt=float(dt), beta=momentum_beta)
     return x + d * dt, denoised, d
 
 
@@ -502,11 +552,11 @@ def heun_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta
         denoised_2 = model_fn(x_next, sigma_next)
         d2 = (x_next - denoised_2) / _safe_sigma(sigma_next)
         d_avg = (d + d2) * 0.5
-        d_avg = _apply_momentum(d_avg, state, force=True, momentum_beta=momentum_beta)
+        d_avg = _ab2_extrapolate(d_avg, state, dt=float(dt), force=True, beta=momentum_beta)
         x_next = x + d_avg * dt
         return x_next, denoised_2, d_avg
 
-    _apply_momentum(d, state, momentum_beta=momentum_beta)
+    _ab2_extrapolate(d, state, dt=float(dt), beta=momentum_beta)
     return x_next, denoised, d
 
 
@@ -532,26 +582,58 @@ def rk4_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta:
     d4 = (x_k4 - denoised_4) / s_next
 
     d_final = (d1 + 2 * d2 + 2 * d3 + d4) / 6.0
-    d_final = _apply_momentum(d_final, state, force=True, momentum_beta=momentum_beta)
+    d_final = _ab2_extrapolate(d_final, state, dt=float(dt), force=True, beta=momentum_beta)
     return x + d_final * dt, denoised_4, d_final
 
 
-def _apply_momentum(d: torch.Tensor, state: SamplerState, force: bool = False,
-                    beta: float = 0.25, momentum_beta: float = None) -> torch.Tensor:
+def _ab2_extrapolate(d: torch.Tensor, state: SamplerState, dt: float,
+                     force: bool = False, beta: float = 0.25,
+                     momentum_beta: Optional[float] = None) -> torch.Tensor:
+    """
+    Variable-step 2nd-order Adams-Bashforth-style derivative extrapolation.
+    Replaces the old exponential-moving-average "momentum": that formulation
+    blended the current derivative *toward the past* value
+    (d_smooth = beta*d_prev + (1-beta)*d), which is a low-pass filter — it damps
+    oscillation but is order-*reducing* (biases the step toward a stale direction,
+    same failure mode as adding numerical drag).
+
+    Classical uniform-step Adams-Bashforth 2 extrapolates *toward the future*
+    instead: f_eff = 1.5*f_n - 0.5*f_{n-1} = f_n + 0.5*(f_n - f_{n-1}), which has
+    local truncation error O(h^2) vs O(h) for plain Euler (Hairer & Wanner,
+    "Solving Ordinary Differential Equations I", ch. III.1). Generalized to the
+    non-uniform step sizes diffusion sigma-schedules actually use (fit a line
+    through the last two (sigma, d) samples, evaluate its extrapolated value over
+    the upcoming interval):
+        f_eff = f_n + (dt_curr / (2 * dt_prev)) * (f_n - f_{n-1})
+    `beta` scales the extrapolation strength (1.0 = the formula above, 0.0 =
+    disabled / plain Euler-consistent). The ratio is clamped to [-1, 1] as a
+    stability limiter — sigma schedules can have sharply uneven step sizes
+    (warmup steps, few-step schedules), and an unclamped ratio can overshoot
+    there; this is the same role a flux/slope limiter plays in predictor-corrector
+    multistep solvers.
+
+    `force=True` (used by heun/rk4, whose `d` is already a locally higher-order
+    estimate from internal sub-evaluations) halves the extrapolation strength to
+    avoid double-counting curvature the step already captured internally.
+    """
     if momentum_beta is not None:
         beta = momentum_beta
-    if state.d_prev is None:
+
+    if state.d_prev is None or state.prev_dt is None or abs(state.prev_dt) < 1e-8 or beta <= 0.0:
         state.d_prev = d.detach().clone()
+        state.prev_dt = dt
         return d
-    t = state.step_count / max(state.total_steps, 1)
-    adaptive_beta = beta * (1.0 - t * 0.5)
+
+    ratio = beta * (dt / (2.0 * state.prev_dt))
     if force:
-        adaptive_beta *= 0.5
-    if state.is_edm:
-        adaptive_beta *= 0.6
-    d_smooth = adaptive_beta * state.d_prev + (1.0 - adaptive_beta) * d
-    state.d_prev = d_smooth.detach().clone()
-    return d_smooth
+        ratio *= 0.5
+    ratio = max(-1.0, min(1.0, ratio))
+
+    d_extrap = d + ratio * (d - state.d_prev)
+
+    state.d_prev = d.detach().clone()
+    state.prev_dt = dt
+    return d_extrap
 
 
 # =========================================================
@@ -634,6 +716,38 @@ class AdaptivePhaseRouter:
 # SDE NOISE
 # =========================================================
 
+def _ancestral_split(sigma: float, sigma_next: float, eta: float) -> Tuple[float, float]:
+    """
+    Standard ancestral-SDE step decomposition — Karras et al. 2022 ("Elucidating
+    the Design Space of Diffusion-Based Generative Models", Alg. 2 / App. sec.
+    on stochastic sampling), equivalent to the reverse-time SDE derivation in
+    Song et al. 2021 ("Score-Based Generative Modeling through SDEs") and the
+    "ancestral" sampler formula used throughout Katherine Crowson's k-diffusion.
+
+    Splits a step from sigma to sigma_next into a *smaller* deterministic step to
+    sigma_down, plus an explicit noise injection of std sigma_up, calibrated so
+    the two combine to reproduce sigma_next's marginal variance exactly:
+        sigma_up   = min(sigma_next, eta * sqrt(sigma_next^2 * (sigma^2 - sigma_next^2)) / sigma)
+        sigma_down = sqrt(sigma_next^2 - sigma_up^2)
+    eta=0 recovers the pure ODE step (sigma_down=sigma_next, sigma_up=0);
+    eta=1 is the full ancestral SDE step.
+
+    This replaces the previous ad hoc noise scale
+    (`sqrt(|dt|) * sigma^0.25 / sigma_max^0.25`, no derivation, tuned by feel) —
+    which was also structurally wrong regardless of the constant: it added noise
+    *on top of* a full deterministic step to sigma_next, rather than trading part
+    of that step for calibrated noise. That over-injects variance beyond the
+    target marginal on every step it fires, compounding across steps.
+    """
+    if sigma <= 1e-9 or sigma_next <= 1e-9 or eta <= 0.0:
+        return sigma_next, 0.0
+    eta = min(eta, 1.0)
+    var_diff = max(sigma ** 2 - sigma_next ** 2, 0.0)
+    sigma_up = min(sigma_next, eta * math.sqrt((sigma_next ** 2) * var_diff) / sigma)
+    sigma_down = math.sqrt(max(sigma_next ** 2 - sigma_up ** 2, 0.0))
+    return sigma_down, sigma_up
+
+
 class AdaptiveSDE:
     def __init__(self, seed: Optional[int] = None):
         self.seed = seed
@@ -646,14 +760,18 @@ class AdaptiveSDE:
                 self._gen.manual_seed(self.seed)
         return self._gen
 
-    def __call__(self, x: torch.Tensor, sigma: float, sigma_next: float,
-                 sigma_max: float, mask: torch.Tensor) -> torch.Tensor:
-        if sigma <= 1e-7:
+    def __call__(self, x: torch.Tensor, sigma_up: float, mask: torch.Tensor) -> torch.Tensor:
+        """
+        mask is a per-pixel gate in [0, 1] (content-aware: only flat/low-detail
+        regions get noise). This spatial gating is a deliberate design choice on
+        top of the calibrated sigma_up magnitude — the classical ancestral formula
+        injects sigma_up uniformly; gating it by local flatness is not part of
+        that derivation, it's this sampler's texture-preservation heuristic.
+        """
+        if sigma_up <= 1e-9:
             return torch.zeros_like(x)
-        dt = sigma_next - sigma
-        scale = (abs(dt) ** 0.5) * (sigma ** 0.25) / (sigma_max ** 0.25)
         noise = torch.randn_like(x, generator=self._get_gen(x.device))
-        return noise * scale * mask
+        return noise * sigma_up * mask
 
 
 # =========================================================
@@ -759,6 +877,84 @@ def get_ddrk_sigmas(scheduler_type: str, steps: int, sigma_min: float,
 
 
 # =========================================================
+# PARAMETER RESOLUTION
+# =========================================================
+
+def _resolve_effective_params(total_steps: int, is_edm: bool, auto_optimize: bool,
+                              integrator: str, sde_strength: float, sharpness: float,
+                              saber_fusion: float, momentum_beta: float
+                              ) -> Tuple[str, float, float, float, float]:
+    """
+    Single source of truth for the auto_optimize / step-count parameter caps.
+
+    This used to be three separate blocks scattered through sample_ddrk_omega,
+    each min()-capping the same variables under overlapping conditions — correct,
+    but impossible to reason about from any one call site. Behavior here is
+    unchanged from before; this only collects the cascade in one place with the
+    exact same order of operations (order matters for the hard 0.0 overrides,
+    doesn't matter for the min() caps since they're idempotent).
+    """
+    debug_lines = []
+
+    if auto_optimize and not is_edm:
+        if total_steps <= 10:
+            saber_fusion = 0.0
+            sde_strength = 0.0
+            momentum_beta = 0.0
+            sharpness = min(sharpness, 0.12)
+            if integrator == "auto":
+                integrator = "euler"
+            debug_lines.append(
+                f"[DDRK Auto] FM few-step ({total_steps} steps): "
+                f"SABER=0, SDE=0, momentum=0, sharp={sharpness:.2f}, "
+                f"integrator={integrator}, scheduler=linear, shift<=1.0")
+        elif total_steps <= 20:
+            saber_fusion = min(saber_fusion, 0.05)
+            sde_strength = 0.0
+            momentum_beta = min(momentum_beta, 0.10)
+            sharpness = min(sharpness, 0.15)
+            debug_lines.append(
+                f"[DDRK Auto] FM mid-step ({total_steps} steps): "
+                f"SABER<=0.05, SDE=0, momentum<=0.10, sharp<=0.15")
+
+    if total_steps <= 6:
+        integrator = "euler"
+        saber_fusion = min(saber_fusion, 0.15)
+        sharpness = min(sharpness, 0.2)
+        sde_strength = 0.0
+
+    if not is_edm:
+        sharpness = min(sharpness, 0.12 if total_steps <= 10 else 0.15)
+        saber_fusion = min(saber_fusion, 0.15)
+        momentum_beta = min(momentum_beta, 0.15)
+    elif total_steps <= 10 and integrator == "rk4":
+        integrator = "heun"
+
+    for line in debug_lines:
+        print(line)
+
+    return integrator, sde_strength, sharpness, saber_fusion, momentum_beta
+
+
+def _integrator_step(chosen_integrator: str, x: torch.Tensor, sigma_curr, sigma_target,
+                     model_fn, state: SamplerState, momentum_beta: float):
+    """
+    Single dispatch point for rk4/heun/euler. Phases 1/2/3 used to each carry
+    their own copy of this if/elif/else — identical except for which
+    sigma_target they passed in and what post-processing ran after it returned.
+    That post-processing (SDE injection, SABER fuse conditions, final sharpen)
+    is genuinely phase-specific and stays inline at each call site; only the
+    integrator selection itself was duplicated, so only that moves here.
+    """
+    if chosen_integrator == "rk4":
+        return rk4_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
+    elif chosen_integrator == "heun":
+        return heun_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
+    else:
+        return euler_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
+
+
+# =========================================================
 # CORE SAMPLER
 # =========================================================
 
@@ -779,8 +975,11 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     cfg_rescale = kwargs.get("cfg_rescale", 0.0)
     momentum_beta = kwargs.get("momentum_beta", 0.25)
     s_churn = kwargs.get("s_churn", 0.0)
+    # Karras et al. Alg. 2 default is s_tmin=0, s_tmax=inf (churn active across the
+    # whole sigma range). Both are now real UI params; float('inf') is only the
+    # fallback for extra_options dicts saved before this param existed.
     s_tmin = kwargs.get("s_tmin", 0.0)
-    s_tmax = float('inf')
+    s_tmax = kwargs.get("s_tmax", float('inf'))
     s_noise = kwargs.get("s_noise", 1.0)
     auto_optimize = kwargs.get("auto_optimize", True)
 
@@ -797,40 +996,10 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     sigma_max = float(sigmas.max())
     is_edm = sigma_max > 5.0
 
-    if auto_optimize and not is_edm:
-        if total_steps <= 10:
-            saber_fusion = 0.0
-            sde_strength = 0.0
-            momentum_beta = 0.0
-            sharpness = min(sharpness, 0.12)
-            if integrator == "auto":
-                integrator = "euler"
-            print(f"[DDRK Auto] FM few-step ({total_steps} steps): "
-                  f"SABER=0, SDE=0, momentum=0, sharp={sharpness:.2f}, "
-                  f"integrator={integrator}, scheduler=linear, shift<=1.0")
-        elif total_steps <= 20:
-            saber_fusion = min(saber_fusion, 0.05)
-            sde_strength = 0.0
-            momentum_beta = min(momentum_beta, 0.10)
-            sharpness = min(sharpness, 0.15)
-            print(f"[DDRK Auto] FM mid-step ({total_steps} steps): "
-                  f"SABER<=0.05, SDE=0, momentum<=0.10, sharp<=0.15")
-
-    if total_steps <= 6:
-        integrator = "euler"
-        saber_fusion = min(saber_fusion, 0.15)
-        sharpness = min(sharpness, 0.2)
-        sde_strength = 0.0
-    if not is_edm:
-        if total_steps <= 10:
-            sharpness = min(sharpness, 0.12)
-        else:
-            sharpness = min(sharpness, 0.15)
-        saber_fusion = min(saber_fusion, 0.15)
-        momentum_beta = min(momentum_beta, 0.15)
-    elif total_steps <= 10:
-        if integrator == "rk4":
-            integrator = "heun"
+    integrator, sde_strength, sharpness, saber_fusion, momentum_beta = _resolve_effective_params(
+        total_steps, is_edm, auto_optimize, integrator, sde_strength, sharpness,
+        saber_fusion, momentum_beta,
+    )
 
     state = SamplerState(total_steps=total_steps, is_edm=is_edm)
     router = AdaptivePhaseRouter(total_steps, sigma_max, is_edm)
@@ -878,39 +1047,38 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
         chosen_integrator = router.pick_integrator(i, float(sigma_curr), integrator, state)
 
         if phase == 1:
-            if chosen_integrator == "rk4":
-                x_next, preview_denoised, _ = rk4_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
-            elif chosen_integrator == "heun":
-                x_next, preview_denoised, _ = heun_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+            sde_active = (not is_edm) and sde_strength > 0 and float(sigma_next) > 1e-7
+            if sde_active:
+                # Ancestral split: trade part of the deterministic step for
+                # calibrated noise (see _ancestral_split docstring). The
+                # integrator steps to sigma_down_t, not sigma_next — the noise
+                # injected below makes up the calibrated difference.
+                sigma_down, sigma_up = _ancestral_split(float(sigma_curr), float(sigma_next), eta=sde_strength)
+                sigma_down_t = torch.tensor(sigma_down, device=work_device, dtype=torch.float32)
             else:
-                x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+                sigma_down_t = sigma_next
 
-            if not is_edm and sde_strength > 0 and float(sigma_next) > 1e-7:
+            x_next, preview_denoised, _ = _integrator_step(
+                chosen_integrator, x, sigma_curr, sigma_down_t, model_fn, state, momentum_beta)
+
+            if sde_active and sigma_up > 1e-9:
                 edge_mask = log_mask(x_next)
                 entropy = local_entropy_mask(x_next, window=5)
-                flat_mask = (1.0 - edge_mask) * entropy * sde_strength
-                x_next = x_next + sde(x_next, float(sigma_curr), float(sigma_next), sigma_max, flat_mask)
+                flat_mask = ((1.0 - edge_mask) * entropy).clamp(0.0, 1.0)
+                x_next = x_next + sde(x_next, sigma_up, flat_mask)
 
             if is_edm and float(sigma_curr) > 0.55 * sigma_max:
                 x_next = saber.fuse(x_next)
 
         elif phase == 2:
-            if chosen_integrator == "rk4":
-                x_next, preview_denoised, _ = rk4_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
-            elif chosen_integrator == "heun":
-                x_next, preview_denoised, _ = heun_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
-            else:
-                x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+            x_next, preview_denoised, _ = _integrator_step(
+                chosen_integrator, x, sigma_curr, sigma_next, model_fn, state, momentum_beta)
             if not is_edm:
                 x_next = saber.fuse(x_next)
 
         else:
-            if chosen_integrator == "rk4":
-                x_next, preview_denoised, _ = rk4_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
-            elif chosen_integrator == "heun":
-                x_next, preview_denoised, _ = heun_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
-            else:
-                x_next, preview_denoised, _ = euler_step(x, sigma_curr, sigma_next, model_fn, state, momentum_beta=momentum_beta)
+            x_next, preview_denoised, _ = _integrator_step(
+                chosen_integrator, x, sigma_curr, sigma_next, model_fn, state, momentum_beta)
             if saber_mode in ("video", "auto") and x_next.dim() == 5 and x_next.shape[2] > 1:
                 x_next = saber.fuse(x_next)
             if i == total_steps - 1 and sharpness > 0:
@@ -923,7 +1091,14 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
         if is_edm:
             x_next = _soft_clamp(x_next, bound=10.0, softness=0.8)
 
-        if preview_denoised is not None and state.prev_denoised is not None:
+        # curvature only feeds router.pick_integrator()'s phase-1 "auto" branch —
+        # computing it (and syncing via .item()) is pure overhead in two cases:
+        # phase 2/3 (never reads it, already excluded above) and, until now,
+        # every phase-1 step even when the user pinned integrator to a fixed
+        # rk4/heun/euler — pick_integrator returns that pin immediately and never
+        # looks at curvature, so the sync was firing for no reason. Gate on the
+        # actual "auto" config, not on which integrator ended up chosen.
+        if integrator == "auto" and phase == 1 and preview_denoised is not None and state.prev_denoised is not None:
             with torch.no_grad():
                 diff = (preview_denoised - state.prev_denoised).abs().mean()
                 base = state.prev_denoised.abs().mean().clamp_min(1e-8)
@@ -945,7 +1120,18 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             "denoised": preview_denoised,
             })
 
-    x = torch.clamp(x, -7.0, 7.0)
+    # The module docstring (v1.5.0) explains per-step soft-clamp was removed for FM
+    # because it flattens fine texture (fur/hair). The old unconditional final
+    # clamp(-7, 7) contradicted that: it's gentler than a per-step clamp, but on FM
+    # outputs whose legitimate dynamic range can exceed 7 it silently re-introduced
+    # the same kind of clipping the changelog says it fixed. Now: EDM keeps the
+    # original safety clamp (matches Karras-style bounded latents); FM only gets a
+    # much wider guard against actual divergence (NaN/inf-adjacent blowups), not
+    # routine clipping of texture extremes.
+    if is_edm:
+        x = torch.clamp(x, -7.0, 7.0)
+    else:
+        x = torch.clamp(x, -20.0, 20.0)
     return x
 
 
@@ -1042,6 +1228,14 @@ class DDRKOmegaSamplerNode:
                     "default": 0.0, "min": 0.0, "max": 100.0, "step": 1.0,
                     "tooltip": "EDM churn (Karras Alg 2). 0 = off. Try 5-15 for SDXL. EDM models only; silently ignored for Flow Matching."
                 }),
+                "s_tmin": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 999999.0, "step": 0.1,
+                    "tooltip": "EDM churn lower sigma bound (Karras Alg 2). Churn only fires while s_tmin <= sigma <= s_tmax. 0.0 = no lower bound."
+                }),
+                "s_tmax": ("FLOAT", {
+                    "default": 999999.0, "min": 0.0, "max": 999999.0, "step": 1.0,
+                    "tooltip": "EDM churn upper sigma bound. Default (max) means unbounded, matching Karras Alg 2's s_tmax=inf. Lower it to restrict churn to high-sigma steps only."
+                }),
                 "s_noise": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                     "tooltip": "EDM churn noise multiplier. 1.0 = standard."
@@ -1063,8 +1257,8 @@ class DDRKOmegaSamplerNode:
 
     def get_sampler(self, integrator, sde_strength, sharpness, saber_fusion,
                     saber_mode, use_ema_saber, ema_decay, dyn_thresh_percentile,
-                    cfg_rescale, momentum_beta, sde_seed, s_churn, s_noise,
-                    content_aware, auto_optimize):
+                    cfg_rescale, momentum_beta, sde_seed, s_churn, s_tmin, s_tmax,
+                    s_noise, content_aware, auto_optimize):
         extra = {
             "integrator": integrator,
             "sde_strength": sde_strength,
@@ -1078,6 +1272,8 @@ class DDRKOmegaSamplerNode:
             "momentum_beta": momentum_beta,
             "sde_seed": sde_seed if sde_seed >= 0 else None,
             "s_churn": s_churn,
+            "s_tmin": s_tmin,
+            "s_tmax": s_tmax,
             "s_noise": s_noise,
             "content_aware": content_aware,
             "auto_optimize": auto_optimize,
@@ -1161,6 +1357,14 @@ class DDRKOmegaUnifiedKSamplerNode:
                     "default": 0.0, "min": 0.0, "max": 100.0, "step": 1.0,
                     "tooltip": "EDM churn (Karras Alg 2). 0 = off. Try 5-15 for SDXL. EDM models only; silently ignored for Flow Matching."
                 }),
+                "s_tmin": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 999999.0, "step": 0.1,
+                    "tooltip": "EDM churn lower sigma bound (Karras Alg 2). Churn only fires while s_tmin <= sigma <= s_tmax. 0.0 = no lower bound."
+                }),
+                "s_tmax": ("FLOAT", {
+                    "default": 999999.0, "min": 0.0, "max": 999999.0, "step": 1.0,
+                    "tooltip": "EDM churn upper sigma bound. Default (max) means unbounded, matching Karras Alg 2's s_tmax=inf. Lower it to restrict churn to high-sigma steps only."
+                }),
                 "s_noise": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                     "tooltip": "EDM churn noise multiplier. 1.0 = standard."
@@ -1181,8 +1385,8 @@ class DDRKOmegaUnifiedKSamplerNode:
                sharpness, warmup_steps, auto_optimize, smart_defaults,
                saber_fusion=0.30, saber_mode="auto", use_ema_saber=True,
                ema_decay=0.7, dyn_thresh_percentile=0.995, cfg_rescale=0.0,
-               momentum_beta=0.25, sde_seed=-1, s_churn=0.0, s_noise=1.0,
-               content_aware=True):
+               momentum_beta=0.25, sde_seed=-1, s_churn=0.0, s_tmin=0.0,
+               s_tmax=999999.0, s_noise=1.0, content_aware=True):
         # Keep the full latent dict to preserve metadata (noise_mask, etc.)
         latent = latent_image.copy()
         latent_samples = latent["samples"]
@@ -1254,6 +1458,8 @@ class DDRKOmegaUnifiedKSamplerNode:
             "momentum_beta": momentum_beta,
             "sde_seed": sde_seed if sde_seed >= 0 else None,
             "s_churn": s_churn,
+            "s_tmin": s_tmin,
+            "s_tmax": s_tmax,
             "s_noise": s_noise,
             "content_aware": content_aware,
             "auto_optimize": auto_optimize,
@@ -1288,4 +1494,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DDRKOmegaUnifiedKSamplerNode": "DDRK Omega Unified KSampler",
     "DDRKOmegaSmartConfigNode": "DDRK Omega Smart Config",
 }
-
