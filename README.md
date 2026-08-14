@@ -360,5 +360,8 @@ Open an [issue](https://github.com/HVOSTOVSKY/DDRK-Omega-Sampler/issues) with th
 
 **MIT License**
 
+**«One sampler to rule them all — from Flux to SDXL.»**
+
 </div>
-*«One sampler to rule them all — from Flux to SDXL.»*
+
+
