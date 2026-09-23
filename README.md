@@ -11,7 +11,7 @@
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-custom%20node-1f6feb?style=flat-square)](https://github.com/comfyanonymous/ComfyUI)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.6.0-8957e5?style=flat-square)](#changelog)
+[![Version](https://img.shields.io/badge/version-1.9.0-8957e5?style=flat-square)](#changelog)
 
 </div>
 
@@ -23,7 +23,7 @@ DDRK Omega is a single sampler node that handles **Flow Matching** models (Flux,
 
 The goal is a node you drop in and use — not one you tune for an hour per checkpoint.
 
-Version 1.6.0 introduces **HC2**, a new integrator that reaches second-order accuracy at one model call per step, and completes a correctness pass driven by the sampler's own telemetry.
+Version 1.7.0 added **DDRK Omega Lite**, a thin preset-driven wrapper for ordinary use. Version 1.9.0 is the first release validated on real images rather than only by CPU tests: it adds a **second pass** (latent-space hires fix) and fixes Flow Matching noise injection - see [Measured on images](#measured-on-images-190).
 
 <div align="center">
 
@@ -52,19 +52,53 @@ Restart ComfyUI. No dependencies beyond what ComfyUI already requires.
 
 ## Quick start
 
-Drop in **DDRK Omega Unified KSampler** in place of the stock KSampler, leave `smart_defaults` and `auto_optimize` on, and set steps and CFG as your checkpoint's model card recommends. That is the whole setup.
+For the shortest setup, use **DDRK Omega Lite**. Connect the model, conditioning and latent, choose steps/CFG as the checkpoint recommends, then leave `quality = balanced` and `character = neutral` until you want a deliberate trade-off. On Flow Matching, `quality = best` adds the second pass: noticeably more detail for roughly 1.7x the time.
 
-To try HC2 explicitly, set `integrator` to `hc2`.
+Use the model's native resolution (about 1 MP for Flux, Krea 2, Qwen, SDXL). Nothing in a sampler recovers what a 512x512 canvas cannot hold - see the first comparison below.
+
+Use **DDRK Omega Unified KSampler** when you need direct access to schedules, HC2 controls, SDE, SABER, restarts, or telemetry. The full node remains unchanged and available alongside Lite.
+
+---
+
+## Measured on images (1.9.0)
+
+Bench: one process loads the model once and runs every variant with the same seed, prompt and resolution; each image is compared by eye and by RMSE to a high-accuracy reference of the same seed (RK4, 24 steps = 96 model calls; lower RMSE = closer to the exact solution of the same ODE). Models: RedCraft Krea 2 (FM, distilled, 12 steps, CFG 1, 1024x1024, 3 seeds) and MolKeunMix Anima (FM, 25 steps, CFG 4, 832x1216, 2 seeds). Hardware: RTX 2070 8 GB. All sheets are in [`docs/ab-1.9.0/`](docs/ab-1.9.0/).
+
+**Canvas size matters more than any sampler setting.**
+
+<img src="docs/ab-1.9.0/01_canvas_512_vs_1024.jpg" width="100%" alt="512 vs 1024">
+
+**The pre-1.8.0 Flow Matching defaults washed images out.** Cosine schedule + `auto_flow_shift` + limiter 0.995 + the old `sigma_adapt` controller: RMSE to the reference **0.286 / 0.281**, against **0.108 / 0.155** for the current defaults.
+
+<img src="docs/ab-1.9.0/02_anima_old_vs_new_defaults_s505050.jpg" width="100%" alt="old vs new defaults">
+
+**The second pass adds real detail** (1.33x, denoise 0.35): on every seed of both models, without changing the composition. Cost on an RTX 2070: Krea 2 12 steps went from 71 s to 125 s; peak VRAM 7.1 GB at 1360x1360.
+
+<img src="docs/ab-1.9.0/03_second_pass_s505050.jpg" width="100%" alt="second pass">
+
+**HC2 is the most accurate integrator at equal model calls where it matters** (Anima, CFG 4, ~25 calls):
+
+| Integrator | Calls | RMSE seed 5050 | RMSE seed 505050 |
+|:--|--:|--:|--:|
+| Euler, 25 steps | 25 | 0.123 | 0.210 |
+| Heun, 13 steps | 25 | 0.123 | 0.230 |
+| **HC2, 25 steps** | 25 | **0.108** | **0.155** |
+
+<img src="docs/ab-1.9.0/04_integrators_equal_calls_s505050.jpg" width="100%" alt="integrators">
+
+On the distilled Krea 2 at 12 steps and CFG 1 the three integrators were visually close. The integrator matters where the trajectory is hard.
+
+**`hc2_space = flow` is a draw on images.** It is the exact FM parameterisation of HC2's correction (below), and on the analytic FM problem it is more accurate from 10 steps up but less accurate at 6-8. On images it was 0.106 vs 0.108 on one seed and 0.165 vs 0.155 on the other. It ships opt-in; `ve` stays the default.
 
 ---
 
 ## What is actually verified
 
-This section exists because it is easy for a project like this to accumulate claims. Everything below was measured with the built-in telemetry on real generations across five checkpoints (Anima, Krea2, Qwen, Illustrious, PonyXL).
+This section exists because it is easy for a project like this to accumulate claims. Image-path results below were measured with the built-in telemetry on real generations across five checkpoints (Anima, Krea2, Qwen, Illustrious, PonyXL); convergence orders were measured separately on the stated synthetic ODE.
 
 ### Measured
 
-**HC2 order of accuracy.** On a semi-linear test ODE with a known solution, error falls 4x per halving of the step (second order) against Euler's 2x. At an equal number of model evaluations it was ~33x more accurate at 40 steps.
+**Integrator convergence.** On the semi-linear test ODE with a known solution, the measured convergence orders are: Euler **1.02**, Heun **2.03**, RK4 **4.02**, HC2 order 2 **2.01**, and HC2 order 3 **3.11**. At an equal budget of 32 model calls, HC2 order 2 is **13.8x more accurate than Heun**, and HC2 order 3 is **11x more accurate than RK4**. These are numerical integration results, not an image-quality score.
 
 **HC2 vs Heun on Flow Matching, equal compute.** HC2 at 20 steps (20 calls) vs Heun at 10 steps (19 calls), three seeds, every enhancer at zero: HC2's final latent held a **16-25% wider dynamic range on all three seeds**, mean +21%. The same metric had previously separated Euler from Heun/RK4 and matched blind visual judgement both times.
 
@@ -82,14 +116,18 @@ This section exists because it is easy for a project like this to accumulate cla
 
 A plausible explanation: HC2 assumes the denoiser varies smoothly in lambda = -log(sigma). The Karras EDM schedule is already close to uniform in lambda, so it does much of that work already. Flow Matching schedules cannot be uniform in lambda — sigma reaches exactly zero, so lambda diverges — which is where an exponential integrator has the most to offer. **This explanation is plausible but not proven**, and it cannot be tested directly on Flow Matching for the same structural reason.
 
-**The corrector and adaptive step placement did not show a measurable effect.** Both remain in the code, opt-in and off by default, documented as experimental.
+**The selective corrector did not show a consistent measurable gain.** It remains opt-in and off by default. **Adaptive step placement did:** `sigma_adapt=0.10` was the largest single measured gain (+3.3% dynamic range), while the response saturates above 0.20 and higher values can hurt. **That measurement is of the pre-1.8.0 controller, which live telemetry showed was sign-inverted** (it lengthened the step after a high-error step, raised the last non-zero sigma by 10% and produced near-empty steps). 1.8.0 fixes the controller; the fixed version has not yet been compared on images, and the dynamic-range gain may have been the larger final jump rather than better detail.
+
+**SABER consistently narrows dynamic range.** It is a deliberate smoothing control with a real cost and is not a default in Lite. Repeated external reports of a SABER memory leak were investigated and rejected as false positives; no leak workaround is applied.
+
+**Small SDE strengths were indistinguishable from off.** Values from 0.08 through 0.15 stayed within 0.2% of the deterministic dynamic range in the measured runs. **The old sharpness cap was binding, not a plateau:** 0.12 still increased the measured effect, so larger values remain reachable but unvalidated.
 
 ### Not verified
 
-- Individual enhancers (SABER, sharpening, AB2 extrapolation) have not been ablated against each other. Their defaults are starting points, not tuned optima.
+- Cross-enhancer interactions and AB2 extrapolation have not been fully ablated. SABER, SDE, sharpening, and sigma adaptation do have the individual measurements stated here; unlisted combinations remain starting points rather than tuned optima.
 - HC2's third-order mode is mathematically verified on synthetic ODEs but rarely accepted on real trajectories at low step counts, and has not been shown to improve images.
 - Dynamic range is a proxy metric. It tracked visual quality in every comparison where the difference was obvious, and stopped discriminating on subtle ones.
-- No automated tests.
+- GPU image quality is not automatically tested; CPU tests verify numerics, invariants, shape handling, and wrapper equivalence.
 
 ---
 
@@ -166,17 +204,50 @@ PHASE 3  (remainder)
 
 | Node | Purpose |
 |:--|:--|
-| **DDRK Omega Unified KSampler** | All-in-one drop-in replacement for the stock KSampler. Start here. |
+| **DDRK Omega Lite** | Thin preset wrapper over the Unified node. Five adjustable controls: seed, steps, CFG, quality, and character. Start here for ordinary use. |
+| **DDRK Omega Unified KSampler** | Full all-in-one replacement with every schedule, integrator, enhancer, and diagnostic control. |
 | **DDRK Omega Sampler** | Returns a `SAMPLER` object for use with `SamplerCustom`. |
 | **DDRK Omega Scheduler** | Returns a `SIGMAS` schedule only. Also exposes `beta_a` / `beta_b`. |
 | **DDRK Omega Smart Config** | Introspection: detected family, hint text, `guidance_embed`, recommended settings. Deliberately does not guess steps or CFG. |
+
+### DDRK Omega Lite mapping
+
+Lite calls the same Unified node and the same `sample_ddrk_omega` implementation; it does not contain a second sampler. `ddrk_auto` selects the family-appropriate schedule, denoise is 1.0, auto-optimization and stochastic features are off, and all unlisted full-node controls use the values shown below. Tests compare every quality/character combination against the equivalent full-node configuration with `torch.equal`.
+
+**Quality**
+
+| Model family | Fast | Balanced (default) | Best |
+|:--|:--|:--|:--|
+| Flow Matching | HC2 order 2, `sigma_adapt=0` | HC2 order 2, `sigma_adapt=0.10` | HC2 order 2, `sigma_adapt=0.10`, second pass 1.33x |
+| EDM | Euler, `sigma_adapt=0` | Heun, `sigma_adapt=0` | RK4, `sigma_adapt=0` |
+
+**Euler is deliberately absent from the Flow Matching row.** HC2 order 2 costs exactly the same one model call per step as Euler, and on the analytic convergence problem it was more accurate at every step count tested - 4x better at 2 steps, 21x at 3, 17x at 8, 41x at 20. There is no step count at which Euler is the better trade on FM, so no quality level offers it.
+
+Because of that, the FM quality dial is **not a speed control** - all three levels cost one model call per step, apart from a single extra bootstrap call at `best`. The speed control is the steps widget. The dial trades numerical aggressiveness.
+
+Since 1.9.0, `best` on FM is `balanced` plus the **second pass** (1.33x upscale, denoise 0.35, about 40% of the base steps and at least 4). It replaced HC2 order 3, which live telemetry showed was accepted on one step in nine and never produced a visible gain. `best` is therefore the one FM quality level that costs more time - about 1.7x in the measurements above.
+
+HC2 is deliberately absent from the EDM row: controlled testing found **no HC2 advantage on EDM**. “Best” identifies the highest-compute preset in this small interface; it is not a claim that every model or step count will produce a visually superior image. The EDM row is inherited from the family defaults and has **not** been compared at equal compute - RK4 spends four model calls per step.
+
+**Character**
+
+| Choice | Sharpness | SABER fusion | Meaning |
+|:--|--:|--:|:--|
+| Neutral (default) | 0.00 | 0.00 | No stylistic enhancer |
+| Sharp | 0.12 | 0.00 | Measured sharpness setting; FM only |
+| Smooth | 0.00 | 0.10 | Deliberate SABER smoothing with its measured dynamic-range cost |
+
+On EDM, `sharp` is bit-identical to `neutral` because sharpening is disabled for that family by design. SABER is never a default: it consistently narrows dynamic range and is exposed only through the explicit `smooth` choice.
+
+**Fixed Lite controls:** `sde_strength=0`, `s_churn=0`, `restart_repeats=0`, `momentum_beta=0`, `dyn_thresh_percentile=1.0` (off since 1.8.0), `limiter_kappa=1.0`, `hc2_corrector=0`, `latent_rescale=0`, `content_aware=true`. (`hc2_max_order` is set by the quality dial, see above.)
 
 ### Schedulers
 
 | Scheduler | Family | Notes |
 |:--|:--|:--|
-| `ddrk_auto` | both | Picks per family and step count. Recommended. |
-| `ddrk_cosine` | FM | Cosine decay |
+| `ddrk_auto` | both | EDM: `ddrk_edm_karras`. FM: `ddrk_model` (since 1.8.0; it used to be `ddrk_cosine`). Recommended. |
+| `ddrk_model` | both | The model's own schedule: `comfy.samplers.calculate_sigmas(model_sampling, "simple", steps)`. The shift comes from the model and any `ModelSampling*` node in the graph; `flow_shift` / `auto_flow_shift` are ignored. Falls back loudly to `ddrk_flow_linear` / `ddrk_edm_karras` when no model sampling is available. |
+| `ddrk_cosine` | FM | Cosine decay. Densest at sigma ~1: with a shift on top, the first steps are near-empty and the final jump is large (live Krea 2: 0.37-0.40 to zero at 1 MP). Not used by `ddrk_auto` any more. |
 | `ddrk_beta` | FM | Shaped by `beta_a` / `beta_b`; defaults 2.0 / 1.0 give Karras-like shrinking steps |
 | `ddrk_flow_linear` | FM | Linear with shift |
 | `ddrk_flow_cosmos` | FM | Cosmos-style tail |
@@ -198,7 +269,7 @@ PHASE 3  (remainder)
 | `sharpness` | Final-step perceptual sharpen. **FM only** — sharpening is disabled on EDM by design. |
 | `saber_fusion` | Spatial/temporal stabilization weight. 0 disables the module entirely. |
 | `momentum_beta` | AB2 derivative extrapolation. 0 = plain integrator. Ignored by HC2, which does this analytically. |
-| `dyn_thresh_percentile` | Percentile latent limiter. 1.0 = off. Engages only below 40% (FM) / 30% (EDM) of sigma_max. |
+| `dyn_thresh_percentile` | Percentile latent limiter. 1.0 = off, **the default since 1.8.0**. Engages only below 40% (FM) / 30% (EDM) of sigma_max. At 0.995 it clipped the final FM latent in 4 of 6 live Krea 2 runs (final max = -min exactly); on EDM it fires on most steps. |
 | `latent_rescale` | Attenuates values beyond ~2 std from the per-image mean. **Not** classical CFG-rescale. 0 = off. |
 
 ### HC2
@@ -208,7 +279,18 @@ PHASE 3  (remainder)
 | `limiter_kappa` | Slope limiter strength. 1.0 means the correction may at most double or cancel the step, never reverse it. Lower to 0.5-0.7 if high CFG still blows out highlights. |
 | `hc2_max_order` | 2 (default) or 3. Third order uses two past evaluations and one extra call to bootstrap. |
 | `hc2_corrector` | *Experimental.* 0 = off. Otherwise spends a second call on steps whose correction exceeds this fraction of the first-order step. No measurable effect in testing. |
-| `sigma_adapt` | *Experimental.* 0 = off. Moves intermediate sigmas to equalise estimated error; step count and endpoints unchanged. No measurable effect in testing. |
+| `hc2_space` | `ve` (default) or `flow`. `flow` uses the exact Flow Matching parameterisation - lambda = log((1-sigma)/sigma) and a (1-sigma) weight on the correction. Measured as a draw on images; no effect on EDM. |
+| `sigma_adapt` | 0 = off. Moves intermediate sigmas to equalise estimated error; step count, start and terminal zero unchanged. Since 1.8.0: a step with above-average HC2 activity shortens the next step, the last non-zero sigma is never raised, and no adapted step is shorter than half its reference step. The +3.3% measurement predates this fix (see "Measured, and negative"); re-validate before relying on it. |
+
+### Second pass (1.9.0)
+
+| Parameter | Effect |
+|:--|:--|
+| `refine_scale` | 1.0 = off (default). Above 1.0 the finished latent is upscaled by this factor (bislerp, even sizes, 4-D and 5-D latents) and re-sampled with the same settings. 1.25-1.33 is the measured range. |
+| `refine_denoise` | How much of the upscaled latent is rewritten. 0.35 measured; 0.25 is gentler; above ~0.5 it starts to redraw. |
+| `refine_steps` | Model calls spent at the larger size. 4-8 is enough. |
+
+The second pass needs VRAM for the larger canvas. It was measured on 8 GB for Krea 2 and Anima; very large models (Qwen Image 20B) at 1 MP may not fit at 1.33x.
 
 ### EDM
 
@@ -275,16 +357,41 @@ Starting points, not tuned optima. Only the integrator guidance comes from a con
 ## Known limitations
 
 - **RK4 costs 4 model calls per step, Heun 2, HC2 and Euler 1.** Compare at equal call count, not equal steps.
-- **<=6 steps forces euler** unless HC2 is selected. The console reports the override.
+- **<=6 steps forces euler** unless HC2 is selected, and **EDM <=10 steps turns rk4 into heun** - both regardless of `auto_optimize`. The console reports the replacement and the telemetry header records `integrator_requested` next to the integrator actually used.
 - **`sharpness` does nothing on EDM.** The parameter is shared across families; the feature is not.
 - **HC2 shows no advantage on EDM** at equal compute.
 - **Steps and CFG are never auto-detected.** They depend on training, LoRA and distillation.
-- **Enhancers are not individually ablated.** SABER, SDE and sharpening are on by reputation, not by measurement.
-- **No unit tests.** Schedulers, the ancestral split and the AB2 extrapolation have all been exercised on real generations, but none has an automated test.
+- **SDE noise depends on batch shape.** `torch.randn_like` draws a whole tensor from one seeded generator stream. Changing batch size or shape changes how that stream is partitioned, so an item sampled alone is not guaranteed the same SDE noise it receives inside a larger/differently shaped batch. This does not affect deterministic runs with SDE/churn/restarts off.
+- **The second pass costs time and VRAM** in proportion to `refine_scale` squared; it is not tested on 20B-class models on 8 GB.
+- **CPU tests do not replace GPU image validation.** The automated suite covers schedules, convergence, stepping, batch isolation, 4D/5D execution, Lite mappings, and bit-exact wrapper equivalence. Output-quality claims still require controlled GPU generations.
 
 ---
 
 ## Changelog
+
+### v1.9.0
+
+- **Second pass** (`refine_scale` / `refine_denoise` / `refine_steps`) on the Unified node; Lite `best` on FM now uses it instead of HC2 order 3.
+- **`hc2_space`**: opt-in exact Flow Matching parameterisation of HC2's correction.
+- **Fixed:** FM SDE and FM restart jumps used variance-exploding noise formulas; they now land exactly on the FM marginal.
+- `auto_optimize` on FM at <=10 steps picks HC2 instead of Euler for `auto`.
+- First release with GPU image A/B results; see [Measured on images](#measured-on-images-190) and CHANGELOG.md.
+
+### v1.8.0
+
+- New `ddrk_model` schedule (the model's own shifted "simple" schedule); `ddrk_auto` on Flow Matching now uses it instead of `ddrk_cosine`.
+- `sigma_adapt` controller fixed: sign, last-sigma guard, minimum step.
+- `dyn_thresh_percentile` defaults to 1.0 (off) in every node and in Lite.
+- Honest integrator replacement messages and `integrator_requested` in telemetry.
+- Found from live Elysium telemetry; details in CHANGELOG.md. Sampler output changes for FM `ddrk_auto`, for any run that relied on the old limiter default, and for `sigma_adapt > 0`.
+
+### v1.7.0
+
+- Added **DDRK Omega Lite**, a thin wrapper with quality and character presets mapped to the full node's validated controls.
+- Added full-node/Lite bit-exact tests across FM and EDM mappings, and expanded the shipping-backup batch=1 equivalence guard to four 4D/5D cases with the full enhancer stack.
+- Removed an unused private SDE generator alias and corrected the `sde_seed=-1` tooltip to match its reproducible implementation.
+- Documented exact convergence measurements, the EDM HC2 negative result, SABER's measured cost, and SDE's batch-shape limitation.
+- No sampler output behavior changed.
 
 ### v1.6.0
 
@@ -344,7 +451,7 @@ Starting points, not tuned optima. Only the integrator guidance comes from a con
 
 **Production hardening (v1.1-v1.5.2)** — iterative audits and implementation by **Kimi** (Moonshot AI).
 
-**Telemetry, correctness pass and HC2 (v1.6.0)** — instrumentation, log analysis, integrator design and fixes by **Claude** (Anthropic).
+**Telemetry, correctness pass and HC2 (v1.6.0), live-telemetry fixes (v1.8.0), GPU A/B bench and second pass (v1.9.0)** — by **Claude** (Anthropic).
 
 HC2's core follows the exponential-integrator line of work — Lu et al., *DPM-Solver++* (2022) and Zhao et al., *UniPC* (2023). The ancestral noise split follows Karras et al., *Elucidating the Design Space of Diffusion-Based Generative Models* (2022).
 
@@ -360,8 +467,8 @@ Open an [issue](https://github.com/HVOSTOVSKY/DDRK-Omega-Sampler/issues) with th
 
 **MIT License**
 
-**«One sampler to rule them all — from Flux to SDXL.»**
-
 </div>
+*«One sampler to rule them all — from Flux to SDXL.»*
+
 
 
