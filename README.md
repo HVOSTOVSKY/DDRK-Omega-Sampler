@@ -11,7 +11,7 @@
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-custom%20node-1f6feb?style=flat-square)](https://github.com/comfyanonymous/ComfyUI)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.10.0-8957e5?style=flat-square)](#changelog)
+[![Version](https://img.shields.io/badge/version-1.11.0-8957e5?style=flat-square)](#changelog)
 
 </div>
 
@@ -19,7 +19,7 @@
 
 ## Overview
 
-DDRK Omega is a single sampler node that handles **Flow Matching** models (Flux, SD3, Qwen, Krea, HiDream, Chroma, Lumina) and **EDM** models (SDXL, SD 1.5, SD 2) without switching samplers or relearning parameters per family. It detects the family from the sigma schedule and recalibrates internally.
+DDRK Omega is a single sampler node that handles **Flow Matching** models (Flux, SD3, Qwen, Krea, HiDream, Chroma, Lumina, Wan) and **EDM** models (SDXL, SD 1.5, SD 2) without switching samplers or relearning parameters per family. It asks the model which family it is and recalibrates internally.
 
 The goal is a node you drop in and use — not one you tune for an hour per checkpoint.
 
@@ -27,10 +27,13 @@ Version 1.7.0 added **DDRK Omega Lite**, a thin preset-driven wrapper for ordina
 
 Version 1.10.0 is an audit release. 1.9.0 did not import at all (a stray-line `IndentationError`); 1.10.0 also fixes EDM img2img / hires fix running on the Flow Matching path, `s_churn` and `momentum_beta` numerics, adds an opt-in zero-cost HC2 corrector and a 148-test CPU suite with an exact-solution accuracy bench - see [Checked on an exact problem](#checked-on-an-exact-problem-1100) and [CHANGELOG.md](CHANGELOG.md).
 
+Version 1.11.0 adds **DDRK Omega Auto**, a one-click node that picks steps, CFG, schedule and integrator for the model it is given, and the **HC3 integrator**: third order at one model call per step, and self-damping at high CFG, where every other multistep sampler tested overshoots - see [How it compares](#how-it-compares-1110).
+
 <div align="center">
 
 | | |
 |:--|:--|
+| **HC3 integrator** | Third order at 1 model call/step; falls back towards first order by itself where high CFG makes extrapolation unsafe |
 | **HC2 integrator** | Second order at 1 model call/step — Heun quality at roughly half the compute on Flow Matching |
 | **Adaptive phase routing** | Three phases, each with its own integrator policy and post-processing |
 | **Ancestral SDE** | Calibrated noise split (Karras et al. 2022), gated to flat regions |
@@ -54,11 +57,63 @@ Restart ComfyUI. No dependencies beyond what ComfyUI already requires.
 
 ## Quick start
 
-For the shortest setup, use **DDRK Omega Lite**. Connect the model, conditioning and latent, choose steps/CFG as the checkpoint recommends, then leave `quality = balanced` and `character = neutral` until you want a deliberate trade-off. On Flow Matching, `quality = best` adds the second pass: noticeably more detail for roughly 1.7x the time.
+1. Add **DDRK Omega Auto (one-click)** (right-click → Add Node → sampling → DDRK Omega), or open the ready-made graph from the workflow templates: *DDRK Omega Auto - text to image*.
+2. Connect `model`, `positive`, `negative` and `latent_image` exactly as you would a KSampler, and VAE Decode after it.
+3. Queue. Leave `steps` and `cfg` at 0: the node recognises the model and picks them. The `settings` output - connect it to a *Preview Any* node - says what it chose, e.g. `SDXL [EDM] | 25 steps (auto) | CFG 6 (auto) | HC3 integrator, Karras`.
+
+Then, only if needed:
+
+- **Turbo, Lightning, Hyper, LCM, DMD** or any few-step LoRA/finetune: set `model_type` to *turbo / lightning / few-step* (4-8 steps at CFG 1). Flux schnell and Z-Image Turbo are recognised on their own; a turbo LoRA cannot be seen from the model.
+- **Quality:** `fast` ~0.6x the steps, `balanced` the model's usual count, `best` = 1.5x the steps on SD/SDXL or a second pass at 1.33x resolution on Flow Matching (~1.7x the time).
+- **Your model card says otherwise:** type its steps and CFG in; any value above 0 is used as is.
+- **img2img:** lower `denoise`.
 
 Use the model's native resolution (about 1 MP for Flux, Krea 2, Qwen, SDXL). Nothing in a sampler recovers what a 512x512 canvas cannot hold - see the first comparison below.
 
-Use **DDRK Omega Unified KSampler** when you need direct access to schedules, HC2 controls, SDE, SABER, restarts, or telemetry. The full node remains unchanged and available alongside Lite.
+### Which node?
+
+| Node | For | You set |
+|:--|:--|:--|
+| **DDRK Omega Auto (one-click)** | Everyone. Plug in and queue | nothing; optionally quality, turbo mode, steps/CFG overrides |
+| **DDRK Omega Lite** | Your own steps and CFG, two validated dials | steps, CFG, quality, character |
+| **DDRK Omega Unified KSampler (advanced)** | Every control: schedules, integrators, SDE, churn, restarts, enhancers, second pass, telemetry | everything |
+| **DDRK Omega Sampler / Scheduler** | SamplerCustom / SamplerCustomAdvanced graphs | SAMPLER / SIGMAS objects |
+
+All nodes live under **sampling → DDRK Omega**.
+
+---
+
+## How it compares (1.11.0)
+
+No GPU image run backs this section: it is the exact-solution bench (`python tests/bench_analytic.py`, [below](#checked-on-an-exact-problem-1100)) against ComfyUI's own samplers, at equal model calls, on each family's usual schedule. Error to the exact solution of the sampling ODE (lower is better):
+
+| EDM, Karras | 6 calls | 10 | 16 | 25 |
+|:--|--:|--:|--:|--:|
+| euler, CFG 1 | 0.151 | 0.089 | 0.055 | 0.035 |
+| ipndm, CFG 1 | **0.028** | 0.011 | 0.0034 | 0.0012 |
+| uni_pc_bh2, CFG 1 | 0.187 | 0.035 | 0.0042 | **0.0011** |
+| DDRK hc2, CFG 1 | 0.048 | 0.033 | 0.016 | 0.0056 |
+| **DDRK hc3, CFG 1** | 0.035 | **0.010** | **0.0026** | 0.0012 |
+| euler, CFG 6 | **0.31** | 0.13 | 0.092 | 0.068 |
+| ipndm, CFG 6 | 0.80 | 0.27 | 0.11 | 0.012 |
+| deis, CFG 6 | 0.51 | 0.16 | **0.013** | **0.0052** |
+| uni_pc_bh2, CFG 6 | 1.38 | 0.55 | 0.084 | 0.0058 |
+| DDRK hc2, CFG 6 | 0.70 | 0.22 | 0.025 | 0.010 |
+| **DDRK hc3, CFG 6** | 0.37 | **0.11** | 0.029 | 0.0066 |
+
+**Where DDRK is strong**
+
+- **HC3 is the only sampler that is good in both regimes.** At CFG 1 it matches the best ODE samplers in ComfyUI (ipndm, uni_pc) from 10 calls up. At CFG 6 with few calls every extrapolating method overshoots - ipndm and uni_pc end up 2.6-4.5x *worse than Euler* at 6 calls - while HC3 stays within 20% of Euler and beats everything at 10. Same one model call per step as Euler.
+- **On Flow Matching at CFG 4** HC3 is the most accurate at 10-25 calls (0.030 at 25 against 0.031-0.052 for the rest).
+- **One node for both families**, with the family read from the model, not guessed.
+
+**Where it is not**
+
+- **Flow Matching at CFG 1: all good samplers tie.** With the model's shifted schedule the last step is a one-shot jump to sigma 0 from 0.1-0.4, it returns the posterior *mean*, and that averaging - not the integrator - is most of the error and most of the lost fine detail. The lever there is the schedule: `ddrk_model_beta` (the model's own shift, steps denser at both ends) cut the distance to the data distribution 1.7-4.3x at equal steps on the bench. It is offered, not defaulted, until an image A/B confirms it.
+- **5-6 calls at CFG 1 on EDM:** ipndm, with a four-point history, is still more accurate.
+- **Stochastic sampling:** `dpmpp_3m_sde` reproduces the FM data distribution about 2x better than any ODE sampler at 25 calls. A stochastic HC3 was built and measured no better, so it did not ship. DDRK's own masked `sde_strength` was the *worst* of all on that measure (74 against 25-27 for plain ODE); treat it as a variation dial and leave it at 0 for quality.
+
+---
 
 ---
 
@@ -191,6 +246,34 @@ Third order also pays one extra model call on the first step. A multistep method
 
 ---
 
+## The HC3 integrator (1.11.0)
+
+HC3 is HC2 with two additions. Both are free: one model call per step, like Euler.
+
+**1. A corrector that costs nothing** (the UniC idea from UniPC, Zhao et al. 2023). HC2 has to *extrapolate* the denoiser across a step from past values. One step later the model has been evaluated at the step's end anyway, so the finished step can be redone by *interpolating* between known values - linear through the last two, quadratic through three:
+
+```
+x_n  <-  x_n  +  alpha_n * [ phi2(h) r_a  +  (2 phi3(h) - h phi2(h)) dd ]  -  (the correction HC2 applied)
+
+    r_a = (D_n - D_{n-1}) / h        dd = (r_a - r_{n-1}) / (h + h_{n-1})
+    phi2(h) = h - 1 + e^-h           phi3(h) = h^2/2 - h + 1 - e^-h
+```
+
+It is applied as a delta, so anything done to the latent in between (SABER, clamps) is kept, and it switches itself off after SDE noise, churn or a restart jump, where the latent did not arrive by that step. Measured order: 2.9-3.0 on both families (HC2: 2.0).
+
+**2. Trust damping.** Extrapolation is what makes multistep methods accurate on a resolved trajectory and what makes them overshoot on an unresolved one - high CFG at few steps, where the guided denoiser swings between evaluations. The slope history tells the two apart:
+
+```
+rho   = |r_n - r_{n-1}| / (|r_n| + |r_{n-1}|)      (norms per image in the batch)
+theta = 1 - rho          r_n  <-  theta * r_n
+```
+
+On a smooth trajectory consecutive slopes agree, rho is O(h) and HC3 keeps its order; where they disagree, theta goes to 0 and the step becomes DDIM, which is exact for a denoiser that is constant over the step. DPM-Solver and UniPC lower their order by step index ("lower order final"); HC3 decides per step and per image from what the model actually did. The trust per step is in the telemetry (`hc3_trust`).
+
+Candidates that were measured and *not* adopted: a third-order predictor (worse at 16-25 calls), no limiter or a looser one (mixed), squared or linear-gain damping (worse at CFG 1), a stochastic HC3 (no better than `dpmpp_3m_sde`), and a Richardson correction of the final jump (better at 6-8 FM steps, worse above).
+
+---
+
 ## Architecture
 
 ```
@@ -228,7 +311,8 @@ PHASE 3  (remainder)
 
 | Node | Purpose |
 |:--|:--|
-| **DDRK Omega Lite** | Thin preset wrapper over the Unified node. Five adjustable controls: seed, steps, CFG, quality, and character. Start here for ordinary use. |
+| **DDRK Omega Auto (one-click)** | Recognises the model from its ComfyUI config class and picks steps, CFG, schedule and HC3; `settings` output says what it chose. Start here. |
+| **DDRK Omega Lite** | Thin preset wrapper over the Unified node. Five adjustable controls: seed, steps, CFG, quality, and character. |
 | **DDRK Omega Unified KSampler** | Full all-in-one replacement with every schedule, integrator, enhancer, and diagnostic control. |
 | **DDRK Omega Sampler** | Returns a `SAMPLER` object for use with `SamplerCustom`. |
 | **DDRK Omega Scheduler** | Returns a `SIGMAS` schedule only. Also exposes `beta_a` / `beta_b`. |
@@ -270,6 +354,7 @@ On EDM, `sharp` is bit-identical to `neutral` because sharpening is disabled for
 | Scheduler | Family | Notes |
 |:--|:--|:--|
 | `ddrk_auto` | both | EDM: `ddrk_edm_karras`. FM: `ddrk_model` (since 1.8.0; it used to be `ddrk_cosine`). Recommended. |
+| `ddrk_model_beta` | both | ComfyUI's `beta` scheduler (0.6, 0.6) on the model's own sigma table: the model's shift, steps denser at both ends, a much smaller final jump (0.114 vs 0.250 at 10 FM steps). Analytic bench: 1.7-4.3x closer to the data distribution on FM at equal steps. Not yet A/B-tested on images. Falls back loudly to `ddrk_model` above 138 steps. |
 | `ddrk_model` | both | The model's own schedule: `comfy.samplers.calculate_sigmas(model_sampling, "simple", steps)`. The shift comes from the model and any `ModelSampling*` node in the graph; `flow_shift` / `auto_flow_shift` are ignored. Falls back loudly to `ddrk_flow_linear` / `ddrk_edm_karras` when no model sampling is available. |
 | `ddrk_cosine` | FM | Cosine decay. Densest at sigma ~1: with a shift on top, the first steps are near-empty and the final jump is large (live Krea 2: 0.37-0.40 to zero at 1 MP). Not used by `ddrk_auto` any more. |
 | `ddrk_beta` | FM | Shaped by `beta_a` / `beta_b`; defaults 2.0 / 1.0 give Karras-like shrinking steps |
@@ -288,7 +373,7 @@ On EDM, `sharp` is bit-identical to `neutral` because sharpening is disabled for
 
 | Parameter | Effect |
 |:--|:--|
-| `integrator` | `auto` / `hc2` / `rk4` / `heun` / `euler`. At <=6 steps this is forced to euler unless HC2 is selected; the console reports any override. |
+| `integrator` | `hc3` (default for new nodes since 1.11.0) / `hc2` / `auto` / `rk4` / `heun` / `euler`. At <=6 steps this is forced to euler unless HC2 or HC3 is selected; the console reports any override. |
 | `sde_strength` | Ancestral SDE amount. **FM only** — silently ignored on EDM, which uses `s_churn`. |
 | `sharpness` | Final-step perceptual sharpen. **FM only** — sharpening is disabled on EDM by design. |
 | `saber_fusion` | Spatial/temporal stabilization weight. 0 disables the module entirely. |
@@ -351,16 +436,16 @@ This is the most useful part of the project for anyone modifying it. Most of wha
 
 ## Suggested starting points
 
-Starting points, not tuned optima. Only the integrator guidance comes from a controlled comparison.
+Starting points, not tuned optima. The simplest start is the Auto node, which applies these per model. Only the integrator guidance comes from controlled comparisons (image A/B for HC2 on FM, the exact-solution bench for HC3).
 
 **Flow Matching**
 
 | Parameter | Value |
 |:--|:--|
 | Steps / CFG | Checkpoint-dependent. Distilled: 4-8 / ~1. Base: 20-40 / 1-4. |
-| Scheduler | `ddrk_auto` |
-| Integrator | `hc2`, or `auto` |
-| SDE strength | 0.00-0.08 |
+| Scheduler | `ddrk_auto`; `ddrk_model_beta` to try for finer detail |
+| Integrator | `hc3` (or `hc2`) |
+| SDE strength | 0 (it measured as a variation dial, not a quality dial) |
 | Sharpness | 0.10-0.15 |
 | SABER fusion | 0.00-0.15 |
 
@@ -369,11 +454,11 @@ Starting points, not tuned optima. Only the integrator guidance comes from a con
 | Parameter | Value |
 |:--|:--|
 | Steps / CFG | 20-30 / 7-8 base; 4-8 / 1-2 turbo |
-| Scheduler | `ddrk_auto` -> `ddrk_edm_karras` |
-| Integrator | `auto` or `heun` |
+| Scheduler | `ddrk_auto` -> `ddrk_edm_karras`; `ddrk_model` for Turbo/Lightning |
+| Integrator | `hc3`: at equal model calls (19-39) it was 1.3-21x more accurate than Heun on the exact problem, CFG 1 and 6 |
 | `s_churn` | 0, or 5-15 to try |
 | Sharpness | No effect on EDM |
-| SABER fusion | 0.20 |
+| SABER fusion | 0 (it narrows dynamic range); 0.20 for a deliberately softer look |
 
 **Video (5D latents)** — `saber_mode` = `video` or `auto`, `saber_fusion` 0.20-0.35, `ema_decay` 0.7.
 
@@ -385,10 +470,11 @@ Starting points, not tuned optima. Only the integrator guidance comes from a con
 - **<=6 steps forces euler** unless HC2 is selected, and **EDM <=10 steps turns rk4 into heun** - both regardless of `auto_optimize`. The console reports the replacement and the telemetry header records `integrator_requested` next to the integrator actually used.
 - **`sharpness` does nothing on EDM.** The parameter is shared across families; the feature is not.
 - **HC2 shows no advantage on EDM** at equal compute.
-- **Steps and CFG are never auto-detected.** They depend on training, LoRA and distillation.
+- **Steps and CFG are never auto-detected, except by the Auto node**, and there they are starting values per model class (the ones model makers and ComfyUI's templates use), not measurements. A finetune or a LoRA - above all a turbo/lightning one, which cannot be seen from the model - can need other values; the `settings` output shows what was chosen, and steps/CFG above 0 override it.
+- **HC3, the free corrector and `ddrk_model_beta` are validated on the exact problem and on tiny real ComfyUI models, not on images.** The Auto node uses HC3 on the schedules already validated on images; `ddrk_model_beta` stays opt-in.
 - **SDE noise depends on batch shape.** `torch.randn_like` draws a whole tensor from one seeded generator stream. Changing batch size or shape changes how that stream is partitioned, so an item sampled alone is not guaranteed the same SDE noise it receives inside a larger/differently shaped batch. This does not affect deterministic runs with SDE/churn/restarts off.
 - **The second pass costs time and VRAM** in proportion to `refine_scale` squared; it is not tested on 20B-class models on 8 GB.
-- **CPU tests do not replace GPU image validation.** The automated suite covers schedules, convergence, stepping, batch isolation, 4D/5D execution, Lite mappings, and bit-exact wrapper equivalence. Output-quality claims still require controlled GPU generations.
+- **CPU tests do not replace GPU image validation.** The automated suite covers schedules, convergence, stepping, batch isolation, 4D/5D execution, Lite and Auto mappings, bit-exact wrapper equivalence, and end-to-end runs on tiny real SD 1.5 and Flux models. Output-quality claims still require controlled GPU generations.
 
 ---
 
@@ -398,15 +484,24 @@ The suite runs on CPU against a real ComfyUI checkout. Installed as a custom nod
 
 ```bash
 pip install pytest
-COMFYUI_PATH=/path/to/ComfyUI python -m pytest            # 148 tests, ~15 s
-COMFYUI_PATH=/path/to/ComfyUI python tests/bench_analytic.py   # accuracy tables, ~30 s
+COMFYUI_PATH=/path/to/ComfyUI python -m pytest            # 179 tests, ~30 s
+COMFYUI_PATH=/path/to/ComfyUI python tests/bench_analytic.py   # comparison tables, ~40 s
 ```
 
-Node-level tests replace `comfy.sample.sample_custom` with a stand-in that skips conditioning and model loading but runs ComfyUI's real `KSAMPLER`, so noise scaling, the inpaint wrapper and inverse noise scaling are the production code. GitHub Actions runs the same suite on every push (`.github/workflows/tests.yml`).
+Node-level tests replace `comfy.sample.sample_custom` with a stand-in that skips conditioning and model loading but runs ComfyUI's real `KSAMPLER`, so noise scaling, the inpaint wrapper and inverse noise scaling are the production code. `tests/test_real_models.py` goes further: SD 1.5 and Flux built by `comfy.supported_models` at a few hundred thousand random weights, sampled through the real `sample_custom` - CFGGuider, conditioning, model management and all. GitHub Actions runs the same suite on every push (`.github/workflows/tests.yml`).
 
 ---
 
 ## Changelog
+
+### v1.11.0
+
+- **Added: DDRK Omega Auto (one-click)** - recognises the model and picks steps, CFG, schedule and integrator; turbo/few-step mode; `settings` output; example workflow in the templates browser.
+- **Added: HC3 integrator** - HC2 + zero-cost corrector + trust damping: third order at one call per step, robust at high CFG. Default integrator of new Unified/Sampler nodes and of Smart Config on FM.
+- **Added:** `ddrk_model_beta` schedule (opt-in).
+- **Fixed:** SD3/SD3.5 were detected as Flux; EDM-type models with an unknown `image_model` (Cosmos, PixArt, Hunyuan-DiT) as Flow Matching.
+- **Changed:** new Unified/Sampler nodes start neutral (no SDE, sharpening, SABER or momentum); all nodes under *sampling → DDRK Omega* with descriptions; the example workflows moved to `example_workflows/`.
+- Every 1.10.0 path is bit-identical (918 configurations checked). Details: CHANGELOG.md.
 
 ### v1.10.0
 
@@ -499,7 +594,7 @@ Node-level tests replace `comfy.sample.sample_custom` with a stand-in that skips
 
 **Production hardening (v1.1-v1.5.2)** — iterative audits and implementation by **Kimi** (Moonshot AI).
 
-**Telemetry, correctness pass and HC2 (v1.6.0), live-telemetry fixes (v1.8.0), GPU A/B bench and second pass (v1.9.0), audit, test suite and exact-solution bench (v1.10.0)** — by **Claude** (Anthropic).
+**Telemetry, correctness pass and HC2 (v1.6.0), live-telemetry fixes (v1.8.0), GPU A/B bench and second pass (v1.9.0), audit, test suite and exact-solution bench (v1.10.0), HC3 and the Auto node (v1.11.0)** — by **Claude** (Anthropic).
 
 HC2's core follows the exponential-integrator line of work — Lu et al., *DPM-Solver++* (2022) and Zhao et al., *UniPC* (2023). The ancestral noise split follows Karras et al., *Elucidating the Design Space of Diffusion-Based Generative Models* (2022).
 

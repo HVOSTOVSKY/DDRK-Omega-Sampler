@@ -33,12 +33,13 @@ def test_package_exports_every_node(S):
         sys.modules.pop("ddrk_pkg", None)
     assert set(mod.NODE_CLASS_MAPPINGS) == set(S.NODE_CLASS_MAPPINGS)
     assert set(mod.NODE_DISPLAY_NAME_MAPPINGS) == set(S.NODE_CLASS_MAPPINGS)
-    assert len(S.NODE_CLASS_MAPPINGS) == 6
+    assert len(S.NODE_CLASS_MAPPINGS) == 7
 
 
 @pytest.mark.parametrize("key", ["DDRKFluxConditioning", "DDRKOmegaSchedulerNode",
                                  "DDRKOmegaSamplerNode", "DDRKOmegaUnifiedKSamplerNode",
-                                 "DDRKOmegaLiteKSamplerNode", "DDRKOmegaSmartConfigNode"])
+                                 "DDRKOmegaLiteKSamplerNode", "DDRKOmegaSmartConfigNode",
+                                 "DDRKOmegaAutoNode"])
 def test_inputs_match_function_signature(S, key):
     cls = S.NODE_CLASS_MAPPINGS[key]
     fn = getattr(cls, cls.FUNCTION)
@@ -59,7 +60,7 @@ def test_inputs_match_function_signature(S, key):
 
 @pytest.mark.parametrize("key", ["DDRKFluxConditioning", "DDRKOmegaSchedulerNode",
                                  "DDRKOmegaSamplerNode", "DDRKOmegaUnifiedKSamplerNode",
-                                 "DDRKOmegaLiteKSamplerNode"])
+                                 "DDRKOmegaLiteKSamplerNode", "DDRKOmegaAutoNode"])
 def test_widget_defaults_are_in_range(S, key):
     cls = S.NODE_CLASS_MAPPINGS[key]
     fn = getattr(cls, cls.FUNCTION)
@@ -85,21 +86,52 @@ def test_scheduler_dropdowns_are_all_known(S):
         assert "ddrk_anima" not in choices
 
 
-def test_bundled_workflow_matches_node_widgets(S):
-    """Saved widgets_values are positional; a stale count shifts every value."""
+def _widgets(cls):
+    """Widget names in saved order, with the frontend's extra seed control."""
+    out = []
+    for name, (_, v) in _inputs(cls).items():
+        kind, opts = v[0], (v[1] if len(v) > 1 else {})
+        if isinstance(kind, list) or kind in NODE_WIDGET_TYPES:
+            out.append(name)
+            if kind == "INT" and (opts.get("control_after_generate")
+                                  or name in ("seed", "noise_seed")):
+                out.append(None)          # "fixed" / "randomize" / ...
+    return out
+
+
+def _workflows():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "workflow", "ddrk_test_workflow.json")) as f:
+    folder = os.path.join(root, "example_workflows")
+    return sorted(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".json"))
+
+
+def test_example_workflows_exist():
+    names = [os.path.basename(p) for p in _workflows()]
+    assert any("Auto" in n for n in names), names
+
+
+@pytest.mark.parametrize("path", _workflows(), ids=os.path.basename)
+def test_example_workflows_match_the_nodes(S, path):
+    """Saved widgets_values are positional; a stale count shifts every value."""
+    with open(path) as f:
         wf = json.load(f)
+    ids = {n["id"]: n for n in wf["nodes"]}
+    for lid, src, sslot, dst, dslot, typ in wf["links"]:
+        assert lid in (ids[src]["outputs"][sslot].get("links") or [])
+        assert ids[dst]["inputs"][dslot]["link"] == lid
     checked = 0
     for node in wf["nodes"]:
         cls = S.NODE_CLASS_MAPPINGS.get(node["type"])
         if cls is None:
             continue
-        widgets = [n for n, (_, v) in _inputs(cls).items()
-                   if isinstance(v[0], list) or v[0] in NODE_WIDGET_TYPES]
+        spec = _inputs(cls)
+        widgets = _widgets(cls)
         assert len(node["widgets_values"]) == len(widgets), node["type"]
         for name, value in zip(widgets, node["widgets_values"]):
-            kind, opts = _inputs(cls)[name][1][0], _inputs(cls)[name][1][1]
+            if name is None:
+                assert value in ("fixed", "increment", "decrement", "randomize")
+                continue
+            kind, opts = spec[name][1][0], (spec[name][1][1] if len(spec[name][1]) > 1 else {})
             if isinstance(kind, list):
                 assert value in kind, (node["type"], name, value)
             elif kind in ("INT", "FLOAT"):
@@ -107,4 +139,12 @@ def test_bundled_workflow_matches_node_widgets(S):
             elif kind == "BOOLEAN":
                 assert isinstance(value, bool), (name, value)
         checked += 1
-    assert checked >= 2
+    assert checked >= 1
+
+
+def test_every_node_is_findable(S):
+    """One menu folder, a description and a display name for every node."""
+    for key, cls in S.NODE_CLASS_MAPPINGS.items():
+        assert cls.CATEGORY.startswith("sampling/DDRK Omega"), key
+        assert getattr(cls, "DESCRIPTION", ""), key
+        assert S.NODE_DISPLAY_NAME_MAPPINGS[key].startswith("DDRK"), key

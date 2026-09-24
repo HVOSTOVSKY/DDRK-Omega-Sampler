@@ -169,8 +169,15 @@ def test_smart_config_profiles(S):
     with contextlib.redirect_stdout(io.StringIO()):
         fm = node.detect(FakePatcher(True, SHAPE, image_model="flux"), _latent())
         edm = node.detect(FakePatcher(False, SHAPE), _latent())
-    assert fm[0] == "flux" and fm[5] == "hc2"
+    assert fm[0] == "flux" and fm[5] == "hc3"
     assert edm[0] == "sd15" and edm[5] == "auto" and edm[7] == 0.0
+
+
+def test_smart_config_recognises_sd3(S):
+    """SD3 has no image_model; up to 1.10.0 it was reported as Flux."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        prof = S._detect_model_profile(FakePatcher(True, SHAPE, model_class="SD3"))
+    assert prof["family"] == "sd3" and prof["model_class"] == "SD3"
 
 
 def test_flux_conditioning_passthrough_and_scaling(S):
@@ -185,3 +192,81 @@ def test_flux_conditioning_passthrough_and_scaling(S):
     assert torch.equal(t[0, :4], torch.full((4, 8), 2.0))
     assert torch.equal(t[0, 4:], torch.zeros(2, 8))
     assert torch.equal(emb, torch.ones(1, 6, 8))           # input untouched
+
+
+# ------------------------------------------------------------ Auto node
+
+def _auto(S, model, latent, **kw):
+    args = dict(seed=5, quality="balanced", model_type="auto", steps=0, cfg=0.0)
+    args.update(kw)
+    with contextlib.redirect_stdout(io.StringIO()):
+        return S.DDRKOmegaAutoNode().sample_auto(model, [], [], latent, **args)
+
+
+@pytest.mark.parametrize("model_class,flow,steps,cfg,label", [
+    ("SDXL", False, 25, 6.0, "SDXL"),
+    ("SD15", False, 25, 7.0, "SD 1.5"),
+    ("SD3", True, 28, 4.5, "SD 3"),
+    ("Flux", True, 20, 1.0, "Flux"),
+    ("QwenImage", True, 20, 2.5, "Qwen"),
+    (None, True, 24, 3.5, "Flow Matching model"),
+    (None, False, 25, 6.0, "EDM model"),
+])
+def test_auto_picks_per_model_defaults(S, model_class, flow, steps, cfg, label):
+    model = FakePatcher(flow, SHAPE, model_class=model_class)
+    st = S._auto_settings(model, torch.zeros(SHAPE), "balanced", "auto", 0, 0.0)
+    assert (st["steps"], st["cfg"], st["integrator"]) == (steps, cfg, "hc3")
+    assert label in st["label"] and not st["turbo"]
+    out, summary = _auto(S, model, _latent())
+    assert out["samples"].shape == SHAPE and bool(torch.isfinite(out["samples"]).all())
+    assert model.calls == steps
+    assert f"{steps} steps (auto)" in summary and f"CFG {cfg:g} (auto)" in summary
+
+
+def test_auto_quality_levels(S):
+    edm = {q: S._auto_settings(FakePatcher(False, SHAPE, model_class="SDXL"), None, q,
+                               "auto", 0, 0.0) for q in ("fast", "balanced", "best")}
+    assert [edm[q]["steps"] for q in ("fast", "balanced", "best")] == [15, 25, 38]
+    assert all("refine_scale" not in v for v in edm.values())
+    fm = S._auto_settings(FakePatcher(True, SHAPE, model_class="Flux"), torch.zeros(SHAPE),
+                          "best", "auto", 0, 0.0)
+    assert fm["steps"] == 20 and fm["refine_scale"] > 1.0
+    video = S._auto_settings(FakePatcher(True, SHAPE, model_class="Flux"),
+                             torch.zeros(1, 16, 3, 8, 8), "best", "auto", 0, 0.0)
+    assert "refine_scale" not in video
+
+
+def test_auto_best_on_flow_matching_runs_the_second_pass(S):
+    model = FakePatcher(True, SHAPE, model_class="Flux")
+    out, summary = _auto(S, model, _latent(), quality="best")
+    assert tuple(out["samples"].shape[-2:]) == (22, 22)
+    assert model.calls == 20 + 8 and "second pass" in summary
+
+
+def test_auto_turbo_mode(S):
+    for cls, flow in (("SDXL", False), ("Flux", True)):
+        st = S._auto_settings(FakePatcher(flow, SHAPE, model_class=cls), None, "balanced",
+                              "turbo / lightning / few-step", 0, 0.0)
+        assert (st["steps"], st["cfg"], st["turbo"]) == (6, 1.0, True)
+        # EDM turbo uses the model's own schedule (Lightning's 999/749/... timesteps).
+        assert st["scheduler"] == ("ddrk_model" if not flow else "ddrk_auto")
+    schnell = S._auto_settings(FakePatcher(True, SHAPE, model_class="FluxSchnell"), None,
+                               "fast", "auto", 0, 0.0)
+    assert schnell["turbo"] and schnell["steps"] == 4 and schnell["cfg"] == 1.0
+    forced = S._auto_settings(FakePatcher(True, SHAPE, model_class="SDXL"), None,
+                              "balanced", "standard", 0, 0.0)
+    assert not forced["turbo"]
+
+
+def test_auto_overrides_and_img2img(S):
+    model = FakePatcher(False, SHAPE, model_class="SDXL")
+    init = torch.randn(SHAPE, generator=torch.Generator().manual_seed(1))
+    out, summary = _auto(S, model, {"samples": init}, steps=12, cfg=4.0, denoise=0.5)
+    assert "12 steps |" in summary and "CFG 4 |" in summary and "denoise 0.5" in summary
+    assert model.calls == 12
+    assert bool(torch.isfinite(out["samples"]).all())
+
+
+def test_auto_rejects_unknown_dials(S):
+    with pytest.raises(ValueError):
+        S._auto_settings(FakePatcher(True, SHAPE), None, "ultra", "auto", 0, 0.0)
