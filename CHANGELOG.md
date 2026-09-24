@@ -1,5 +1,121 @@
 # Changelog
 
+## 1.10.0 — 2026-09-24
+
+An audit release. 1.9.0 did not load at all; beyond that, every change below
+is either a bug fix with a regression test or an opt-in option, and the
+default Flow Matching path (Lite, pinned HC2) is bit-identical to 1.9.0.
+Numbers marked *analytic* come from the new CPU bench (`tests/analytic.py`):
+latent elements drawn from a Gaussian mixture, for which the denoiser and the
+exact ODE solution are known, so the error of a sampler can be measured
+directly. That checks numerics. It says nothing about images, and nothing
+below has been run on a GPU.
+
+### Fixed
+
+- **1.9.0 could not be imported.** Two stray lines after
+  `NODE_DISPLAY_NAME_MAPPINGS` were an `IndentationError`, so ComfyUI skipped
+  the whole pack: none of the six nodes appeared.
+- **EDM img2img, hires fix, the second pass and SplitSigmas tails ran on the
+  Flow Matching path.** The family was guessed from the schedule
+  (`sigmas.max() > 5`), so an SDXL/SD1.5 run starting below sigma 5 (denoise
+  below ~0.6) got the FM SDE formula (which scales by 1 - sigma, negative
+  above sigma 1), FM sharpening and no EDM clamp. The sampler now asks the
+  model, as ComfyUI's own samplers do (`isinstance(model_sampling, CONST)`),
+  and falls back to the schedule only for direct calls. *Analytic*, EDM
+  img2img with the Unified node's default settings: RMSE to the exact
+  solution 0.27 -> 0.004 at denoise 0.5-0.7, 0.033 -> 0.004 at 0.3, and the
+  1.9.0 result had ~8% less contrast (std 0.47 vs 0.51).
+- **`s_churn` did not follow Karras Alg. 2.** gamma was
+  `min(s_churn / sigma, sqrt(2) - 1)`; the algorithm (and k-diffusion) uses
+  `s_churn / N`, the number of steps. The old form sat at its cap on almost
+  every step, so values from ~5 up all behaved alike. Existing workflows that
+  use churn will look different: the same number now means what it means in
+  every other sampler.
+- **`momentum_beta` made Heun and RK4 first order.** The AB2 extrapolation was
+  applied on top of their slopes. It now applies to Euler steps only, where
+  it is a genuine Adams-Bashforth 2 step (beta = 1 -> order 2); Heun and RK4
+  ignore it, like HC2 always did. *Analytic*: at beta 0.25 RK4 went from
+  order 4.0 to 0.9 (error ~250x at 128 calls) and Heun from 2.0 to 1.1-1.2.
+  On the realistic schedules the effect is smaller and one-sided by family:
+  EDM Karras, error 1.1-1.9x (Heun) and 1.2-6.2x (RK4) higher with momentum;
+  Flow Matching with the model's schedule, 0-17% *lower*, because there the
+  extrapolation partly offsets the large final jump to sigma 0. This matters
+  for defaults: the Sampler and Unified nodes default to momentum 0.25 with
+  `auto`, which on EDM means Heun/RK4 phases.
+- **The final guard clamp clipped noisy hand-offs.** A fixed +-7 (EDM) /
+  +-20 (FM) is right for a finished latent but clipped one handed on still
+  noisy (a SplitSigmas head at sigma 5 has std ~5). The bound now grows with
+  the output sigma; ending at 0 it is exactly the old bound.
+- **The second pass dropped `noise_mask` and `batch_index`** and so redrew
+  masked-out (inpainting) regions. Both are now carried into it.
+- **`batch_index` was ignored by the Unified/Lite noise**, unlike the stock
+  KSampler (`prepare_noise(..., batch_index)`).
+- **FM noise ignored the model's `noise_scale`** (HiDream-O1 declares 8). SDE
+  and restart noise are now scaled by it, as ComfyUI's RF samplers do.
+- The bundled `workflow/ddrk_test_workflow.json` stored 11 widget values for a
+  node that now has 29, so ComfyUI shifted every value onto the wrong input.
+  Regenerated for the current nodes, with a test that keeps it in sync.
+- `pyproject.toml` pointed the registry icon at `ddrk_logo.png`, which was
+  deleted; it is `logo.png`.
+- Telemetry logged HC2's statistics on non-HC2 steps in auto mode.
+
+### Changed
+
+- **`auto` mode: HC2 steps extrapolate from the previous step.** Every
+  integrator now records the denoiser output at its step's start into HC2's
+  history; before, an HC2 step after a Heun/RK4 step used whatever HC2 step
+  came last, possibly many steps back. *Analytic*: EDM Karras, error 1.6-2.6x
+  lower at 39-49 calls and up to 5% higher at 13-29; Flow Matching, equal or
+  up to 14% lower.
+- **Smart Config / `smart_defaults` on Flow Matching now pick `hc2`** instead
+  of `auto` - the integrator the 1.9.0 image A/B found most accurate at equal
+  calls, and the one Lite uses. The hint text no longer recommends Heun/RK4 on
+  FM.
+- HC2 skips its GPU->CPU statistics (limiter fraction, activity) when neither
+  telemetry nor `sigma_adapt` reads them.
+
+### Added
+
+- **`hc2_free_corrector`** (Unified and Sampler nodes, off by default): a
+  zero-cost corrector in the style of UniPC's UniC (Zhao et al. 2023). After
+  each HC2 step the model is called at the step's end point anyway; that
+  output is also used to redo the finished step by interpolation instead of
+  extrapolation. No extra model calls. *Analytic*: EDM Karras, error 1.1-2x
+  lower than HC2 at 8-12 calls and 1.3-4x at 20-30; the asymptotic order
+  rises from 2 to ~3. On Flow Matching with the model's schedule it is within
+  a few percent (2% worse to 5% better), because there the final one-shot
+  jump to sigma 0 dominates the error and no multistep correction reaches
+  it. Not validated on images: opt-in until an A/B.
+- `hc2_space` on the Sampler node (it was Unified-only).
+- A test suite: `tests/`, 148 CPU tests against a real ComfyUI checkout -
+  schedules, convergence orders, equal-call comparisons, determinism, batch
+  isolation, 4D/5D, call counts, telemetry, every fix above, and the Lite =
+  Unified `torch.equal` check across all quality/character combinations on
+  both families. Each 1.10.0 fix has a test that fails on 1.9.0. Plus
+  `tests/bench_analytic.py`, which prints the accuracy tables, and a GitHub
+  workflow that runs the suite.
+
+### Measured, and negative (analytic)
+
+- **`sigma_adapt = 0.10` was 0-22% *less* accurate than no adaptation** on
+  both families and both mixtures. Lite `balanced`/`best` keep it (the 1.8.0
+  controller has still not been compared on images), but this is one more
+  reason to A/B it.
+- **HC2 order 3 only reaches order 3 with the limiter effectively off**
+  (kappa 100: 3.07); at the default kappa 1 it converges at order 2, because
+  the per-element limiter clips the correction wherever the first-order step
+  passes through zero.
+- **`hc2_space = flow` was not more accurate** than `ve` on the analytic FM
+  problem with the model's schedule (from 9% worse to 2% better), matching the
+  1.9.0 "draw" on images.
+- A final-step Richardson extrapolation (in sigma^2, no extra calls) was tried
+  for the FM final jump: 1.7-2.5x better at 6-8 steps, worse at 20-32 steps
+  and on EDM. Not shipped.
+- HC2 order 2 and ComfyUI's `dpmpp_2m` are within a few percent of each other
+  everywhere measured, as expected: both are second-order exponential
+  multistep methods.
+
 ## 1.9.0 — 2026-09-23
 
 The first release validated on the GPU image path, not only by CPU tests.
@@ -155,5 +271,3 @@ against 1.6.0, verified across 48 scheduler/shape/integrator combinations.
 - Model-family detection keeps its best-effort fallbacks but now announces them
   and records `detected_by` and `detect_warnings` in the profile, so a
   misdetection partway through a sweep is visible afterwards.
-
-### Behaviour changes

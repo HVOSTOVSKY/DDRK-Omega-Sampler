@@ -11,7 +11,7 @@
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-custom%20node-1f6feb?style=flat-square)](https://github.com/comfyanonymous/ComfyUI)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.9.0-8957e5?style=flat-square)](#changelog)
+[![Version](https://img.shields.io/badge/version-1.10.0-8957e5?style=flat-square)](#changelog)
 
 </div>
 
@@ -24,6 +24,8 @@ DDRK Omega is a single sampler node that handles **Flow Matching** models (Flux,
 The goal is a node you drop in and use — not one you tune for an hour per checkpoint.
 
 Version 1.7.0 added **DDRK Omega Lite**, a thin preset-driven wrapper for ordinary use. Version 1.9.0 is the first release validated on real images rather than only by CPU tests: it adds a **second pass** (latent-space hires fix) and fixes Flow Matching noise injection - see [Measured on images](#measured-on-images-190).
+
+Version 1.10.0 is an audit release. 1.9.0 did not import at all (a stray-line `IndentationError`); 1.10.0 also fixes EDM img2img / hires fix running on the Flow Matching path, `s_churn` and `momentum_beta` numerics, adds an opt-in zero-cost HC2 corrector and a 148-test CPU suite with an exact-solution accuracy bench - see [Checked on an exact problem](#checked-on-an-exact-problem-1100) and [CHANGELOG.md](CHANGELOG.md).
 
 <div align="center">
 
@@ -129,6 +131,26 @@ A plausible explanation: HC2 assumes the denoiser varies smoothly in lambda = -l
 - Dynamic range is a proxy metric. It tracked visual quality in every comparison where the difference was obvious, and stopped discriminating on subtle ones.
 - GPU image quality is not automatically tested; CPU tests verify numerics, invariants, shape handling, and wrapper equivalence.
 
+### Checked on an exact problem (1.10.0)
+
+`tests/analytic.py` draws every latent element from a Gaussian mixture. For that data the denoiser and the exact solution of the sampling ODE are known in closed form, so the error of a sampler can be measured directly instead of judged. It is a check of the numerics, not of image quality. RMSE to the exact solution at equal model calls, smooth mixture (`python tests/bench_analytic.py` prints all four cases):
+
+| | EDM, Karras, 12 calls | EDM, 30 calls | FM, model schedule, 12 calls | FM, 30 calls |
+|:--|--:|--:|--:|--:|
+| Euler | 7.4e-2 | 3.0e-2 | 1.07e-1 | 4.5e-2 |
+| Heun (15 steps at 30 calls) | - | 1.27e-2 | - | 4.3e-2 |
+| DPM++ 2M (ComfyUI) | 2.1e-2 | 2.4e-3 | 6.2e-2 | 1.75e-2 |
+| HC2 | 2.6e-2 | 3.6e-3 | 6.2e-2 | 1.74e-2 |
+| HC2 + `hc2_free_corrector` | **1.3e-2** | **8.8e-4** | 6.3e-2 | **1.66e-2** |
+
+What it established:
+
+- **Measured orders** (log-uniform schedule): Euler 1.0, Heun 2.0, RK4 4.0, HC2 2.0; HC2 with the free corrector ~3.
+- **`momentum_beta` broke Heun and RK4** (fixed in 1.10.0): at 0.25 RK4 fell from order 4 to 0.9 and Heun from 2 to ~1.1. On realistic EDM schedules that was 1.1-6x more error; on FM with the model's schedule it happened to be 0-17% less, by partly offsetting the final jump. Momentum now applies to Euler steps only.
+- **The free corrector** lowers HC2's EDM error 1.1-2x at 8-12 calls and 1.3-4x at 20-30, at no extra calls. On FM it is within a few percent: there the **final one-shot jump to sigma 0 dominates the error** - the last step is first order in every sampler - so the integrator matters less than where the last non-zero sigma sits.
+- **`sigma_adapt = 0.10` was 0-22% less accurate** than no adaptation in every case; `hc2_space = flow` was a draw, as on images.
+- **HC2 and DPM++ 2M are within a few percent of each other**, as expected of two second-order exponential multistep methods. HC2's additions are the limiter, the FM parameterisation, the order selection and now the corrector.
+
 ---
 
 ## The HC2 integrator
@@ -183,7 +205,7 @@ PHASE 2  (~35% FM / ~22% EDM)
     EDM  no SABER - mid-step blur shifts anatomy
 
 PHASE 3  (remainder)
-    Euler in auto mode
+    HC2 in auto mode
     FM   final perceptual sharpen on the last step
     EDM  no sharpen
 ```
@@ -192,7 +214,9 @@ PHASE 3  (remainder)
 
 **Ancestral SDE split.** A step from sigma to sigma_next decomposes into a shorter deterministic step to sigma_down plus noise of standard deviation sigma_up, calibrated so the combined variance reproduces sigma_next's marginal exactly (Karras et al. 2022). The spatial gating on top — noise only into flat, low-detail regions — is this sampler's own texture-preservation heuristic, not part of that derivation.
 
-**Soft clamp.** EDM only, bound tied to the noise level (`max(4*sigma, 10)`) rather than a constant. A constant bound was clipping ~39% of the tensor at high sigma — ordinary early noise, not divergence. Flow Matching gets no per-step clamp at all; both families keep a wide final guard against actual blowups.
+**Soft clamp.** EDM only, bound tied to the noise level (`max(4*sigma, 10)`) rather than a constant. A constant bound was clipping ~39% of the tensor at high sigma — ordinary early noise, not divergence. Flow Matching gets no per-step clamp at all; both families keep a wide final guard against actual blowups, which widens with the output sigma so a latent handed on still noisy (SplitSigmas) is not clipped.
+
+**Family detection.** Inside the sampler the family comes from the model (`isinstance(model_sampling, CONST)`, as in ComfyUI's own samplers), not from the schedule. Up to 1.9.0 it was `sigmas.max() > 5`, which sent EDM img2img below denoise ~0.6 down the Flow Matching path.
 
 **Edge detection.** The LoG mask flags pixels whose local curvature exceeds the background level, estimated robustly from the median. A percentile cutoff was used before and was tautological — it marked a fixed 20% of every tensor as "edge" regardless of content, including at step 0 where the latent is still pure noise.
 
@@ -268,7 +292,7 @@ On EDM, `sharp` is bit-identical to `neutral` because sharpening is disabled for
 | `sde_strength` | Ancestral SDE amount. **FM only** — silently ignored on EDM, which uses `s_churn`. |
 | `sharpness` | Final-step perceptual sharpen. **FM only** — sharpening is disabled on EDM by design. |
 | `saber_fusion` | Spatial/temporal stabilization weight. 0 disables the module entirely. |
-| `momentum_beta` | AB2 derivative extrapolation. 0 = plain integrator. Ignored by HC2, which does this analytically. |
+| `momentum_beta` | Adams-Bashforth 2 slope extrapolation for **Euler steps only** (1.0 = full AB2, second order at one call per step). 0 = plain Euler. Ignored by Heun, RK4 and HC2: on a higher-order method it reduced it to first order, see [above](#checked-on-an-exact-problem-1100). |
 | `dyn_thresh_percentile` | Percentile latent limiter. 1.0 = off, **the default since 1.8.0**. Engages only below 40% (FM) / 30% (EDM) of sigma_max. At 0.995 it clipped the final FM latent in 4 of 6 live Krea 2 runs (final max = -min exactly); on EDM it fires on most steps. |
 | `latent_rescale` | Attenuates values beyond ~2 std from the per-image mean. **Not** classical CFG-rescale. 0 = off. |
 
@@ -279,6 +303,7 @@ On EDM, `sharp` is bit-identical to `neutral` because sharpening is disabled for
 | `limiter_kappa` | Slope limiter strength. 1.0 means the correction may at most double or cancel the step, never reverse it. Lower to 0.5-0.7 if high CFG still blows out highlights. |
 | `hc2_max_order` | 2 (default) or 3. Third order uses two past evaluations and one extra call to bootstrap. |
 | `hc2_corrector` | *Experimental.* 0 = off. Otherwise spends a second call on steps whose correction exceeds this fraction of the first-order step. No measurable effect in testing. |
+| `hc2_free_corrector` | *Opt-in, 1.10.0.* Zero-cost corrector (UniPC's UniC idea): the model output HC2 needs for the next step anyway is also used to redo the finished step by interpolation. No extra calls. Analytic bench: 1.1-4x less error on EDM, within a few percent on FM. Not yet validated on images. |
 | `hc2_space` | `ve` (default) or `flow`. `flow` uses the exact Flow Matching parameterisation - lambda = log((1-sigma)/sigma) and a (1-sigma) weight on the correction. Measured as a draw on images; no effect on EDM. |
 | `sigma_adapt` | 0 = off. Moves intermediate sigmas to equalise estimated error; step count, start and terminal zero unchanged. Since 1.8.0: a step with above-average HC2 activity shortens the next step, the last non-zero sigma is never raised, and no adapted step is shorter than half its reference step. The +3.3% measurement predates this fix (see "Measured, and negative"); re-validate before relying on it. |
 
@@ -296,7 +321,7 @@ The second pass needs VRAM for the larger canvas. It was measured on 8 GB for Kr
 
 | Parameter | Effect |
 |:--|:--|
-| `s_churn`, `s_tmin`, `s_tmax`, `s_noise` | Karras Alg. 2 churn. EDM only; `s_churn = 0` disables. |
+| `s_churn`, `s_tmin`, `s_tmax`, `s_noise` | Karras Alg. 2 churn, gamma = min(`s_churn` / steps, sqrt(2) - 1) as in k-diffusion. EDM only; `s_churn = 0` disables. Up to 1.9.0 gamma divided by sigma instead and sat at its cap on almost every step. |
 
 ### Other
 
@@ -306,7 +331,7 @@ The second pass needs VRAM for the larger canvas. It was measured on 8 GB for Kr
 | `use_ema_saber`, `ema_decay` | Temporal EMA for video SABER. |
 | `sde_seed` | -1 derives the seed from the global RNG, reproducible from the workflow seed. |
 | `content_aware` | Edge-gated SABER fusion. Turn off for pixel art and flat-shaded styles. |
-| `auto_optimize` | Caps or disables enhancers by compute budget on FM. Does not touch steps or CFG. |
+| `auto_optimize` | Caps or disables enhancers by compute budget on FM, and at <=10 steps turns `auto` into `hc2`. Does not touch steps, CFG or the schedule. |
 | `smart_defaults` | Sets scheduler, shift, integrator and enhancer levels from the detected family. Does not touch steps or CFG. |
 | `debug_mode`, `debug_tag` | Per-step telemetry to disk. Off by default, zero overhead when off. |
 
@@ -367,7 +392,30 @@ Starting points, not tuned optima. Only the integrator guidance comes from a con
 
 ---
 
+## Running the tests
+
+The suite runs on CPU against a real ComfyUI checkout. Installed as a custom node (`ComfyUI/custom_nodes/DDRK-Omega-Sampler`) it finds ComfyUI on its own; anywhere else, point `COMFYUI_PATH` at one:
+
+```bash
+pip install pytest
+COMFYUI_PATH=/path/to/ComfyUI python -m pytest            # 148 tests, ~15 s
+COMFYUI_PATH=/path/to/ComfyUI python tests/bench_analytic.py   # accuracy tables, ~30 s
+```
+
+Node-level tests replace `comfy.sample.sample_custom` with a stand-in that skips conditioning and model loading but runs ComfyUI's real `KSAMPLER`, so noise scaling, the inpaint wrapper and inverse noise scaling are the production code. GitHub Actions runs the same suite on every push (`.github/workflows/tests.yml`).
+
+---
+
 ## Changelog
+
+### v1.10.0
+
+- **Fixed:** 1.9.0 failed to import (`IndentationError`), so no node loaded.
+- **Fixed:** EDM runs starting below sigma 5 (img2img, hires fix, second pass, SplitSigmas) took the Flow Matching path; the family now comes from the model.
+- **Fixed:** `s_churn` follows Karras Alg. 2 (`s_churn / steps`); `momentum_beta` applies to Euler only (it made Heun/RK4 first order); the final clamp no longer clips noisy hand-offs; the second pass keeps `noise_mask`/`batch_index`; FM noise honours the model's `noise_scale`; the bundled workflow matches the current nodes.
+- **Changed:** `auto` shares HC2 history across integrators; Smart Config picks `hc2` on Flow Matching.
+- **Added:** opt-in `hc2_free_corrector`; `hc2_space` on the Sampler node; 148 CPU tests, an exact-solution accuracy bench and a CI workflow.
+- The default FM path (Lite, pinned HC2) is bit-identical to 1.9.0. Details and every measurement: CHANGELOG.md.
 
 ### v1.9.0
 
@@ -451,7 +499,7 @@ Starting points, not tuned optima. Only the integrator guidance comes from a con
 
 **Production hardening (v1.1-v1.5.2)** — iterative audits and implementation by **Kimi** (Moonshot AI).
 
-**Telemetry, correctness pass and HC2 (v1.6.0), live-telemetry fixes (v1.8.0), GPU A/B bench and second pass (v1.9.0)** — by **Claude** (Anthropic).
+**Telemetry, correctness pass and HC2 (v1.6.0), live-telemetry fixes (v1.8.0), GPU A/B bench and second pass (v1.9.0), audit, test suite and exact-solution bench (v1.10.0)** — by **Claude** (Anthropic).
 
 HC2's core follows the exponential-integrator line of work — Lu et al., *DPM-Solver++* (2022) and Zhao et al., *UniPC* (2023). The ancestral noise split follows Karras et al., *Elucidating the Design Space of Diffusion-Based Generative Models* (2022).
 
