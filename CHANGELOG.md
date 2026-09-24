@@ -1,5 +1,93 @@
 # Changelog
 
+## 1.11.0 — 2026-09-24
+
+A usability and integrator release. Nothing here has been run on a GPU:
+numbers marked *analytic* come from the exact-solution bench
+(`tests/bench_analytic.py`, which now also runs ComfyUI's own samplers
+side by side), and every node has been exercised end to end on tiny real
+SD 1.5 and Flux models built by ComfyUI (`tests/test_real_models.py`). Every
+1.10.0 code path is bit-identical (918 configurations checked).
+
+### Diagnosis that drove it
+
+Measured against euler, dpmpp_2m, ipndm, deis, uni_pc_bh2, res_multistep
+and the SDE samplers at equal model calls:
+
+- **HC2 was a good DPM++ 2M, not a leader.** At CFG 1 on EDM, ipndm and
+  uni_pc_bh2 were 3-5x more accurate at 16-25 calls.
+- **Every multistep method overshoots at high CFG and few steps.** EDM, CFG 6,
+  6 calls: Euler 0.31, HC2 0.70, ipndm 0.80, uni_pc_bh2 1.38. Extrapolating a
+  denoiser that swings between evaluations is worse than not extrapolating.
+- **On Flow Matching the final jump to sigma 0 dominates.** With the model's
+  shifted schedule the last step starts at sigma 0.1-0.4 and returns a
+  posterior mean; all good ODE samplers tie, and the distance to the data
+  distribution stays 15x above an exact sampler at 25 calls.
+- **DDRK's `sde_strength` was the worst sampler tested** on distribution
+  fidelity (74 vs 24-27 for plain ODE samplers at 25 calls, FM).
+- **SD3/SD3.5 were detected as Flux** (no `image_model` in their config), and
+  EDM-type models with an unknown `image_model` as Flow Matching.
+- **Usability:** the Unified node has ~40 inputs, and even Lite needs steps
+  and CFG that most users have to look up per model.
+
+### Added
+
+- **HC3 integrator** (`integrator = hc3`): HC2's predictor + the zero-cost
+  corrector (1.10.0's `hc2_free_corrector`) + *trust damping*: the
+  extrapolated slope is scaled by theta = 1 - |r - r_prev| / (|r| + |r_prev|),
+  per image, so a resolved trajectory keeps full order and an unresolved one
+  falls back to DDIM. One model call per step. *Analytic*: order 2.9-3.0
+  (HC2 2.0); EDM CFG 1, as accurate as ipndm/uni_pc from 10 calls (0.0026
+  vs 0.0034 at 16); EDM CFG 6, 1.8-2.0x better than HC2 at 5-10 calls and
+  within 20% of Euler at 6 (ipndm 2.6x, uni_pc 4.5x worse than Euler);
+  FM CFG 4, the most accurate of all at 10-25 calls. Default integrator of
+  newly created Unified/Sampler nodes and of Smart Config on FM.
+- **DDRK Omega Auto (one-click)**: model, prompts, latent, seed. Recognises
+  the model from its ComfyUI config class (SD 1.5, SD 2, SDXL and variants,
+  SD3, AuraFlow, PixArt, Hunyuan-DiT, Flux, Flux 2, Chroma, Lumina 2,
+  Qwen-Image, HiDream, Anima, Wan, LTX-Video, HunyuanVideo, Cosmos) and picks
+  steps, CFG, schedule and HC3; `quality` fast/balanced/best (best = 1.5x
+  steps on EDM, the image-validated second pass on FM); `model_type` for
+  turbo/lightning/few-step models (Flux schnell and Z-Image Turbo are
+  recognised on their own; EDM turbo uses the model's own schedule, i.e. the
+  timesteps Lightning-style models are distilled at); `steps`/`cfg` > 0
+  override; `denoise` for img2img; a `settings` output with what it chose.
+- **`ddrk_model_beta` schedule** (opt-in): ComfyUI's beta scheduler on the
+  model's own sigma table. *Analytic*, FM: final jump 0.114 instead of 0.250
+  at 10 steps, 1.7-4.3x closer to the data distribution at equal steps.
+- **Example workflows** in `example_workflows/`, so ComfyUI lists them in its
+  templates browser: *DDRK Omega Auto - text to image* (new) and the former
+  `workflow/ddrk_test_workflow.json`.
+- Tests: HC3 (order, equal-call wins, high-CFG robustness, distribution,
+  telemetry), Auto (presets, quality, turbo, overrides, img2img, second
+  pass), SD3 detection, schema/categories, example workflows, and
+  end-to-end runs on tiny real models (179 tests, ~30 s on CPU).
+
+### Fixed
+
+- SD3/SD3.5 are recognised as `sd3` (from the `SD3` config class) instead of
+  Flux; Smart Config reports `model_class`.
+- Models with an `image_model` the table does not know are EDM or FM by
+  their sigma range, not always FM.
+
+### Changed
+
+- **New Unified and Sampler nodes start neutral**: integrator `hc3`, SDE 0,
+  sharpness 0, SABER 0, momentum 0 (were `auto`, 0.08, 0.30 - an untested
+  value - 0.30 and 0.25). Saved workflows keep their own values.
+- All nodes live under **sampling → DDRK Omega** (advanced ones in
+  sub-folders), each with a description; the Unified node is labelled
+  *(advanced)*.
+
+### Measured, and not shipped
+
+- A third-order HC3 predictor (worse at 16-25 calls), no limiter or a looser
+  one (mixed), squared or linear-gain damping (worse at CFG 1).
+- A stochastic HC3 (exact OU noise, eta 0.5-1): no better than
+  `dpmpp_3m_sde`, which remains the best stochastic choice on FM.
+- Richardson correction of the FM final jump: better at 6-8 steps, worse
+  above.
+
 ## 1.10.0 — 2026-09-24
 
 An audit release. 1.9.0 did not load at all; beyond that, every change below

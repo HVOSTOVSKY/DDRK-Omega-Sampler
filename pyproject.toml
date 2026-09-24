@@ -1,7 +1,7 @@
 [project]
 name = "ddrk-omega-sampler"
-description = "Universal domain-adaptive sampler for ComfyUI. Flow Matching + EDM with adaptive phase routing, momentum, SABER stabilization and perceptual sharpening"
-version = "1.10.0"
+description = "One-click universal sampler for ComfyUI: Flow Matching + EDM, the HC3 integrator (third order at one model call per step, self-damping at high CFG), automatic per-model settings"
+version = "1.11.0"
 license = { file = "LICENSE" }
 dependencies = []
 
