@@ -1,5 +1,5 @@
 """
-DDRK Omega Sampler v1.9.0
+DDRK Omega Sampler v1.10.0
 ComfyUI | Flow Matching + EDM Universal Sampler
 https://github.com/HVOSTOVSKY/DDRK-Omega-Sampler
 """
@@ -61,6 +61,22 @@ class SamplerState:
     # high-order terms that the exact data-prediction integral carries.
     hc2_flow: bool = False
 
+    # Denoiser output at the START of the last step, whatever integrator took
+    # it. Every integrator evaluates D(x, sigma) first; since 1.10.0 that
+    # value also feeds HC2's history, so an HC2 step that follows a Heun or
+    # RK4 step in auto mode extrapolates from the previous step instead of
+    # from whichever step last happened to be HC2.
+    last_D: Optional[torch.Tensor] = None
+
+    # Zero-cost corrector (hc2_free_corrector): what the previous HC2 step
+    # needs to be corrected once the denoiser at its end point is known.
+    hc2_pc: Optional[Dict[str, Any]] = None
+    hc2_free_corr: float = -1.0
+
+    # False skips the diagnostics that need a GPU->CPU sync (limiter
+    # fraction, activity) when nothing reads them.
+    hc2_stats: bool = True
+
 
 # Clamp for the Flow Matching log-SNR at sigma = 1, where it is -inf. Same
 # offset ComfyUI uses for its own RF multistep samplers.
@@ -74,6 +90,20 @@ def _hc2_lambda(sigma: float, flow: bool) -> float:
         s = min(s, _FLOW_SIGMA_CAP)
         return math.log((1.0 - s) / s)
     return -math.log(s)
+
+
+def _phi2(h: float) -> float:
+    """h - 1 + e^-h: weight of the first derivative of D over a step of h."""
+    if abs(h) < 1e-3:
+        return h * h / 2.0 - h ** 3 / 6.0 + h ** 4 / 24.0
+    return (h - 1.0) + math.exp(-h)
+
+
+def _phi3(h: float) -> float:
+    """h^2/2 - h + 1 - e^-h: weight of the second derivative of D over h."""
+    if abs(h) < 1e-3:
+        return h ** 3 / 6.0 - h ** 4 / 24.0 + h ** 5 / 120.0
+    return (h * h / 2.0 - h + 1.0) - math.exp(-h)
 
 
 class DeviceDtypeGuard:
@@ -241,23 +271,26 @@ def _detect_model_profile(model, latent_samples=None) -> dict:
             flow_shift=1.0,
 
 
-            integrator="auto",
+            # hc2, not auto: on FM it was the most accurate integrator at
+            # equal model calls in the 1.9.0 image A/B (Anima, CFG 4), and it
+            # is what Lite uses. auto spends 2-4 calls per step in phase 1.
+            integrator="hc2",
             sde_strength=0.0,
             sharpness=0.10,
             saber_fusion=0.0,
             momentum_beta=0.0,
             hint=(f"{family.upper()}: Flow Matching. Steps/CFG vary wildly by checkpoint. "
                   f"{'Guidance embed detected — distilled variant, try CFG≈1.0, steps 4-8. ' if guidance_embed else ''}"
-                  f"Check your model card. Integrator note: at a fixed model-call "
-                  f"budget heun/rk4 beat euler on FM in testing — heun at N steps "
-                  f"costs about the same as euler at 2N and looked better."),
+                  f"Check your model card. Integrator: hc2 (one model call per step; "
+                  f"the most accurate at equal calls in the 1.9.0 image A/B). "
+                  f"Use the model's native resolution (~1 MP)."),
         )
     elif family == "fm":
         profile.update(
             scheduler_type="ddrk_auto",
             flow_shift=1.5,
 
-            integrator="auto",
+            integrator="hc2",
             sde_strength=0.0,
             sharpness=0.12,
             saber_fusion=0.0,
@@ -567,14 +600,19 @@ def _safe_sigma(s: Union[float, torch.Tensor]) -> float:
 
 def euler_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta: float = None):
     denoised = model_fn(x, sigma)
+    state.last_D = denoised
     d = (x - denoised) / _safe_sigma(sigma)
     dt = sigma_next - sigma
     d = _ab2_extrapolate(d, state, dt=float(dt), beta=momentum_beta)
     return x + d * dt, denoised, d
 
 
+# heun_step and rk4_step accept momentum_beta for call compatibility but no
+# longer apply it (1.10.0). They still record their slope, so an Euler step
+# that follows them in auto mode extrapolates from the right history.
 def heun_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta: float = None):
     denoised = model_fn(x, sigma)
+    state.last_D = denoised
     d = (x - denoised) / _safe_sigma(sigma)
     dt = sigma_next - sigma
     x_next = x + d * dt
@@ -583,11 +621,11 @@ def heun_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta
         denoised_2 = model_fn(x_next, sigma_next)
         d2 = (x_next - denoised_2) / _safe_sigma(sigma_next)
         d_avg = (d + d2) * 0.5
-        d_avg = _ab2_extrapolate(d_avg, state, dt=float(dt), force=True, beta=momentum_beta)
+        _ab2_extrapolate(d_avg, state, dt=float(dt), beta=0.0)
         x_next = x + d_avg * dt
         return x_next, denoised_2, d_avg
 
-    _ab2_extrapolate(d, state, dt=float(dt), beta=momentum_beta)
+    _ab2_extrapolate(d, state, dt=float(dt), beta=0.0)
     return x_next, denoised, d
 
 
@@ -599,15 +637,17 @@ def rk4_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta:
 
 
         denoised = model_fn(x, sigma)
+        state.last_D = denoised
         d = (x - denoised) / s
         x_next = x + d * dt
-        _ab2_extrapolate(d, state, dt=float(dt), beta=momentum_beta)
+        _ab2_extrapolate(d, state, dt=float(dt), beta=0.0)
         return x_next, denoised, d
 
     s_mid = _safe_sigma(sigma + dt * 0.5)
     s_next = _safe_sigma(sigma_next)
 
     denoised_1 = model_fn(x, sigma)
+    state.last_D = denoised_1
     d1 = (x - denoised_1) / s
 
     x_k2 = x + d1 * (dt * 0.5)
@@ -623,19 +663,74 @@ def rk4_step(x, sigma, sigma_next, model_fn, state: SamplerState, momentum_beta:
     d4 = (x_k4 - denoised_4) / s_next
 
     d_final = (d1 + 2 * d2 + 2 * d3 + d4) / 6.0
-    d_final = _ab2_extrapolate(d_final, state, dt=float(dt), force=True, beta=momentum_beta)
+    _ab2_extrapolate(d_final, state, dt=float(dt), beta=0.0)
     return x + d_final * dt, denoised_4, d_final
+
+
+def _hc2_free_correction(pc: Dict[str, Any], denoised: torch.Tensor,
+                         lam: float) -> Optional[torch.Tensor]:
+    """Zero-cost corrector for the HC2 step that just ended (UniC-style).
+
+    The predictor had to EXTRAPOLATE the denoiser across its step from past
+    evaluations. Once the model has been called at the step's end point, the
+    same step can be redone by INTERPOLATING between known values instead -
+    linear through D_prev and D_now, quadratic when one more past value is
+    available - without another model call. The previous HC2 step's
+    correction is swapped for the interpolated one; the result is returned
+    as a delta so anything applied to the latent in between (SABER, clamps)
+    is kept. The next step uses the model output taken at the uncorrected
+    point, as UniPC does (Zhao et al. 2023); that costs nothing in order.
+
+    Measured on the analytic mixture bench (tests/bench_analytic.py) at equal
+    model calls, EDM Karras: error 1.1-2x lower than HC2 at 8-12 calls,
+    1.3-4x at 20-30, and the order rises from 2 to ~3. On Flow Matching with
+    the model's schedule it is within a few percent, because there the final
+    one-shot jump to sigma = 0 dominates the error and no multistep
+    correction reaches it. Not validated on images.
+    """
+    h = lam - pc["lam"]
+    if abs(lam - pc["lam_next"]) > 1e-6 or abs(h) < 1e-8:
+        # The latent did not arrive here by that step (SDE re-noising,
+        # churn, a restart jump, another integrator): nothing to correct.
+        return None
+    alpha = pc["alpha_next"]
+    r_a = (denoised - pc["D"]) / h
+    corr = r_a * (alpha * _phi2(h))
+    if pc["D2"] is not None:
+        h_b = pc["lam"] - pc["lam2"]
+        if abs(h_b) > 1e-8:
+            r_b = (pc["D"] - pc["D2"]) / h_b
+            dd = (r_a - r_b) / (h + h_b)
+            corr = corr + dd * (alpha * (2.0 * _phi3(h) - h * _phi2(h)))
+    applied = pc["applied"]
+    return corr - applied if applied is not None else corr
 
 
 def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
              momentum_beta: float = None, limiter_kappa: float = 1.0,
-             max_order: int = 2, corrector_thresh: float = 0.0):
+             max_order: int = 2, corrector_thresh: float = 0.0,
+             free_corrector: bool = False):
     s = _safe_sigma(sigma)
     sigma_next_f = float(sigma_next)
 
     denoised = model_fn(x, sigma)
+    state.last_D = denoised
     flow = bool(getattr(state, "hc2_flow", False))
     lam = _hc2_lambda(s, flow)
+
+    pc, state.hc2_pc = state.hc2_pc, None
+    state.hc2_free_corr = -1.0
+    # On the final step the output is the denoiser itself, so correcting x
+    # there would change nothing.
+    if free_corrector and pc is not None and sigma_next_f > 1e-7:
+        delta = _hc2_free_correction(pc, denoised, lam)
+        if delta is not None:
+            x = x + delta
+            if state.hc2_stats:
+                try:
+                    state.hc2_free_corr = float(delta.abs().mean().item())
+                except Exception:
+                    state.hc2_free_corr = -1.0
 
     if sigma_next_f <= 1e-7:
 
@@ -669,6 +764,8 @@ def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
                    else (1.0 - exp_neg_h)) * (denoised - x)
     x_next = x + first_order
     order_used = 1
+    applied = None
+    bootstrapped = False
     state.hc2_limited_frac = -1.0
     state.hc2_err_ratio = -1.0
     state.hc2_activity = -1.0
@@ -685,6 +782,7 @@ def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
         d2 = (x_next - denoised_2) / _safe_sigma(sigma_next)
         x_next = x + (d1 + d2) * 0.5 * (float(sigma_next) - float(sigma))
         order_used = 2
+        bootstrapped = True
 
     elif has_1 and abs(h_prev) > 1e-8:
         r = (denoised - state.hc2_D_prev) / h_prev
@@ -722,19 +820,21 @@ def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
 
         bound = limiter_kappa * first_order.abs()
         limited = torch.clamp(correction, -bound, bound)
-        try:
-            state.hc2_limited_frac = float(
-                (correction.abs() > bound).float().mean().item())
+        if state.hc2_stats or corrector_thresh > 0.0:
+            try:
+                state.hc2_limited_frac = float(
+                    (correction.abs() > bound).float().mean().item())
 
 
-            fo_mean = float(first_order.abs().mean().item())
-            x_scale = float(x.abs().mean().item())
-            denom = max(fo_mean, 1e-3 * max(x_scale, 1e-8))
-            state.hc2_activity = min(
-                float(correction.abs().mean().item()) / denom, 100.0)
-        except Exception:
-            state.hc2_limited_frac = -1.0
+                fo_mean = float(first_order.abs().mean().item())
+                x_scale = float(x.abs().mean().item())
+                denom = max(fo_mean, 1e-3 * max(x_scale, 1e-8))
+                state.hc2_activity = min(
+                    float(correction.abs().mean().item()) / denom, 100.0)
+            except Exception:
+                state.hc2_limited_frac = -1.0
         x_next = x_next + limited
+        applied = limited
 
         if corrector_thresh > 0.0 and state.hc2_activity > corrector_thresh:
 
@@ -744,7 +844,16 @@ def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
             corr_c = r_c * (alpha_next * ((h - 1.0) + exp_neg_h))
             corr_c = torch.clamp(corr_c, -bound, bound)
             x_next = x + first_order + corr_c
+            applied = corr_c
             state.hc2_corrector_fired = True
+
+    if free_corrector and not bootstrapped:
+        state.hc2_pc = {
+            "lam": lam, "lam_next": lam + h, "alpha_next": alpha_next,
+            "D": denoised, "applied": applied,
+            "D2": state.hc2_D_prev if has_1 else None,
+            "lam2": state.hc2_lambda_prev if has_1 else None,
+        }
 
     state.hc2_order_used = order_used
     state.hc2_D_prev2, state.hc2_lambda_prev2 = state.hc2_D_prev, state.hc2_lambda_prev
@@ -760,8 +869,22 @@ def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
 def _ab2_extrapolate(d: torch.Tensor, state: SamplerState, dt: float,
                      force: bool = False, beta: float = 0.25,
                      momentum_beta: Optional[float] = None) -> torch.Tensor:
+    """Adams-Bashforth 2 slope extrapolation (momentum_beta), Euler only.
+
+    beta = 1 turns Euler into variable-step AB2, a genuine second-order
+    method; smaller values interpolate between the two. Up to 1.9.0 the same
+    extrapolation was also applied on top of Heun and RK4, where it adds an
+    O(dt) term to a slope that is already accurate to O(dt^2) or O(dt^4),
+    which makes both methods first order. Measured on the analytic mixture
+    bench (tests/analytic.py, lambda-uniform schedule, 128-256 calls): RK4
+    went from order 4.0 to 0.9 at beta = 0.25 and its error grew ~250x;
+    Heun from order 2.0 to 1.1-1.2, error 3-5x. Heun and RK4 now call this
+    with beta = 0 so that it only records their slope.
+    """
     if momentum_beta is not None:
         beta = momentum_beta
+    if beta is None:
+        beta = 0.0
 
     if state.d_prev is None or state.prev_dt is None or abs(state.prev_dt) < 1e-8 or beta <= 0.0:
         state.d_prev = d.detach().clone()
@@ -1233,17 +1356,18 @@ def _resolve_effective_params(total_steps: int, is_edm: bool, auto_optimize: boo
 def _integrator_step(chosen_integrator: str, x: torch.Tensor, sigma_curr, sigma_target,
                      model_fn, state: SamplerState, momentum_beta: float,
                      limiter_kappa: float = 1.0, hc2_max_order: int = 2,
-                     hc2_corrector: float = 0.0):
+                     hc2_corrector: float = 0.0, hc2_free_corrector: bool = False):
     if chosen_integrator == "hc2":
         return hc2_step(x, sigma_curr, sigma_target, model_fn, state,
                         momentum_beta=momentum_beta, limiter_kappa=limiter_kappa,
-                        max_order=hc2_max_order, corrector_thresh=hc2_corrector)
-    elif chosen_integrator == "rk4":
-        return rk4_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
+                        max_order=hc2_max_order, corrector_thresh=hc2_corrector,
+                        free_corrector=hc2_free_corrector)
+    if chosen_integrator == "rk4":
+        out = rk4_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
     elif chosen_integrator == "heun":
-        return heun_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
+        out = heun_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
     elif chosen_integrator == "euler":
-        return euler_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
+        out = euler_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
     else:
         # An unrecognised name used to fall through to Euler in silence. Through the
         # node dropdowns that was unreachable, but a sweep script driving the sampler
@@ -1254,6 +1378,15 @@ def _integrator_step(chosen_integrator: str, x: torch.Tensor, sigma_curr, sigma_
             f"Unknown integrator {chosen_integrator!r}. "
             f"Expected one of: auto, euler, heun, rk4, hc2."
         )
+    # Feed the denoiser value at this step's start into HC2's history. Only
+    # auto mode mixes integrators, so a pinned euler/heun/rk4 run never reads
+    # it and is unaffected.
+    if state.last_D is not None:
+        lam = _hc2_lambda(_safe_sigma(sigma_curr), bool(state.hc2_flow))
+        state.hc2_D_prev2, state.hc2_lambda_prev2 = state.hc2_D_prev, state.hc2_lambda_prev
+        state.hc2_D_prev, state.hc2_lambda_prev = state.last_D, lam
+    state.hc2_pc = None
+    return out
 
 
 def _conditioning_fingerprint(extra_args) -> str:
@@ -1414,6 +1547,38 @@ def _dbg_delta(before: torch.Tensor, after: torch.Tensor):
         return {"error": str(e)}
 
 
+def _sampling_family(model, sigmas: torch.Tensor) -> Tuple[float, bool, float, str]:
+    """(sigma_max, is_edm, noise_scale, source) for the model being sampled.
+
+    Up to 1.9.0 the family was guessed from the schedule alone
+    (sigmas.max() > 5). A schedule that starts low - img2img or a hires fix
+    at denoise below ~0.6, the second pass, a SplitSigmas tail - put an
+    SDXL or SD1.5 run through the Flow Matching path: the FM noise formulas
+    (which scale by 1 - sigma, negative above sigma = 1), FM sharpening, no
+    EDM clamp. ComfyUI's own samplers ask the model instead
+    (isinstance(model_sampling, CONST)), and so does this now. The schedule
+    heuristic remains the fallback for direct calls without a ComfyUI model.
+    """
+    ms = None
+    try:
+        ms = model.inner_model.inner_model.model_sampling
+    except AttributeError:
+        pass
+    if ms is not None:
+        try:
+            import comfy.model_sampling as cms
+            is_edm = not isinstance(ms, cms.CONST)
+            sigma_max = float(ms.sigma_max)
+            noise_scale = float(getattr(ms, "noise_scale", 1.0)) if not is_edm else 1.0
+            if math.isfinite(sigma_max) and sigma_max > 0.0:
+                return sigma_max, is_edm, noise_scale, "model_sampling"
+        except Exception as e:
+            print(f"[DDRK] model_sampling unreadable ({type(e).__name__}: {e}); "
+                  f"guessing the family from the schedule.")
+    sigma_max = float(sigmas.max())
+    return sigma_max, sigma_max > 5.0, 1.0, "schedule"
+
+
 _ADAPT_MIN_GAP = 0.5  # no adapted step shorter than half its reference step
 
 
@@ -1503,6 +1668,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     limiter_kappa = kwargs.get("limiter_kappa", 1.0)
     hc2_max_order = int(kwargs.get("hc2_max_order", 2))
     hc2_corrector = float(kwargs.get("hc2_corrector", 0.0))
+    hc2_free_corrector = bool(kwargs.get("hc2_free_corrector", False))
     restart_repeats = int(kwargs.get("restart_repeats", 0))
     restart_steps = int(kwargs.get("restart_steps", 3))
     restart_t_min = float(kwargs.get("restart_t_min", 0.10))
@@ -1529,8 +1695,10 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     if total_steps < 1:
         return x
 
-    sigma_max = float(sigmas.max())
-    is_edm = sigma_max > 5.0
+    sigma_max, is_edm, noise_scale, family_source = _sampling_family(model, sigmas)
+    # Karras Alg. 2 divides s_churn by the number of steps; restarts added
+    # below do not count, as they do not in k-diffusion.
+    churn_steps = total_steps
 
     integrator_requested = integrator
     integrator, sde_strength, sharpness, saber_fusion, momentum_beta = _resolve_effective_params(
@@ -1542,8 +1710,11 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
     if rec is not None:
         rec.meta.update({
             "is_edm": is_edm,
+            "family_source": family_source,
+            "noise_scale": noise_scale,
             "total_steps": total_steps,
             "sigma_max": sigma_max,
+            "sigma_start": float(sigmas[0]),
             "integrator_param": integrator,
             "integrator_requested": integrator_requested,
             "sde_strength": sde_strength,
@@ -1556,6 +1727,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             "limiter_kappa": limiter_kappa,
             "hc2_max_order": hc2_max_order,
             "hc2_corrector": hc2_corrector,
+            "hc2_free_corrector": hc2_free_corrector,
             "sigma_adapt": sigma_adapt,
             "restart_repeats": restart_repeats,
             "restart_steps": restart_steps,
@@ -1592,6 +1764,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
         raise ValueError(f"Unknown hc2_space {hc2_space!r}. "
                          f"Expected one of: ve, flow.")
     state.hc2_flow = hc2_space == "flow" and not is_edm
+    state.hc2_stats = rec is not None or sigma_adapt > 0.0
     if rec is not None:
         rec.meta["hc2_space"] = ("flow" if state.hc2_flow else "ve")
     router = AdaptivePhaseRouter(total_steps, sigma_max, is_edm)
@@ -1691,13 +1864,14 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
                 if is_edm:
                     x = x + noise * (var ** 0.5)
                 else:
-                    x = _renoise_flow(x, sc, sn, noise)
+                    x = _renoise_flow(x, sc, sn, noise * noise_scale)
 
 
             state.hc2_D_prev = None
             state.hc2_lambda_prev = None
             state.hc2_D_prev2 = None
             state.hc2_lambda_prev2 = None
+            state.hc2_pc = None
             state.d_prev = None
             state.prev_denoised = None
             if rec is not None:
@@ -1716,7 +1890,12 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             sigma_curr_pre_churn = float(sigma_curr)
 
         if is_edm and s_churn > 0 and s_tmin <= float(sigma_curr) <= s_tmax:
-            gamma = min(s_churn / float(sigma_curr), math.sqrt(2) - 1)
+            # Karras et al. 2022, Alg. 2: gamma = min(S_churn / N, sqrt(2) - 1)
+            # with N the number of steps, as in k-diffusion. Up to 1.9.0 this
+            # divided by sigma instead, so gamma sat at its sqrt(2) - 1 cap on
+            # every step below sigma = S_churn / 0.414 (most of an SDXL run at
+            # any useful setting) and the dial barely changed anything.
+            gamma = min(s_churn / churn_steps, math.sqrt(2) - 1)
             sigma_hat = float(sigma_curr) * (1.0 + gamma)
 
 
@@ -1730,6 +1909,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             state.hc2_lambda_prev = None
             state.hc2_D_prev2 = None
             state.hc2_lambda_prev2 = None
+            state.hc2_pc = None
             state.d_prev = None
             if rec is not None:
                 step_rec["churn_fired"] = True
@@ -1764,7 +1944,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             x_next, preview_denoised, _ = _integrator_step(
                 chosen_integrator, x, sigma_curr, sigma_down_t, model_fn, state, momentum_beta,
                 limiter_kappa=limiter_kappa, hc2_max_order=hc2_max_order,
-                hc2_corrector=hc2_corrector)
+                hc2_corrector=hc2_corrector, hc2_free_corrector=hc2_free_corrector)
 
             if sde_active and sigma_up > 1e-9:
                 edge_mask = log_mask(x_next)
@@ -1775,7 +1955,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
                 # latent is still rescaled, so a masked-out region lands at
                 # std below sigma_next - the same trade-off the VE version
                 # made, where masked regions were simply under-noised.
-                x_next = x_next * flow_ratio + sde(x_next, sigma_up, flat_mask)
+                x_next = x_next * flow_ratio + sde(x_next, sigma_up * noise_scale, flat_mask)
                 if rec is not None:
                     step_rec["sde_fired"] = True
                     step_rec["sigma_up"] = round(float(sigma_up), 5)
@@ -1803,7 +1983,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             x_next, preview_denoised, _ = _integrator_step(
                 chosen_integrator, x, sigma_curr, sigma_next, model_fn, state, momentum_beta,
                 limiter_kappa=limiter_kappa, hc2_max_order=hc2_max_order,
-                hc2_corrector=hc2_corrector)
+                hc2_corrector=hc2_corrector, hc2_free_corrector=hc2_free_corrector)
             if not is_edm and saber_fusion > 0:
                 x_before_saber = x_next if rec is not None else None
                 x_next = saber.fuse(x_next)
@@ -1817,7 +1997,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             x_next, preview_denoised, _ = _integrator_step(
                 chosen_integrator, x, sigma_curr, sigma_next, model_fn, state, momentum_beta,
                 limiter_kappa=limiter_kappa, hc2_max_order=hc2_max_order,
-                hc2_corrector=hc2_corrector)
+                hc2_corrector=hc2_corrector, hc2_free_corrector=hc2_free_corrector)
             if (saber_fusion > 0 and saber_mode in ("video", "auto")
                     and x_next.dim() == 5 and x_next.shape[2] > 1):
                 x_before_saber = x_next if rec is not None else None
@@ -1880,16 +2060,21 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
 
         if rec is not None:
             step_rec["curvature"] = state.curvature if integrator == "auto" and phase == 1 else None
-            if state.hc2_limited_frac >= 0.0:
-                step_rec["hc2_limiter_frac"] = round(state.hc2_limited_frac, 5)
-            if state.hc2_order_used:
-                step_rec["hc2_order"] = state.hc2_order_used
-            if state.hc2_err_ratio >= 0.0:
-                step_rec["hc2_err_ratio"] = round(state.hc2_err_ratio, 5)
-            if state.hc2_activity >= 0.0:
-                step_rec["hc2_activity"] = round(state.hc2_activity, 5)
-            if state.hc2_corrector_fired:
-                step_rec["hc2_corrector_fired"] = True
+            # HC2's fields persist between its steps; in auto mode only log
+            # them on steps HC2 actually took.
+            if chosen_integrator == "hc2":
+                if state.hc2_limited_frac >= 0.0:
+                    step_rec["hc2_limiter_frac"] = round(state.hc2_limited_frac, 5)
+                if state.hc2_order_used:
+                    step_rec["hc2_order"] = state.hc2_order_used
+                if state.hc2_err_ratio >= 0.0:
+                    step_rec["hc2_err_ratio"] = round(state.hc2_err_ratio, 5)
+                if state.hc2_activity >= 0.0:
+                    step_rec["hc2_activity"] = round(state.hc2_activity, 5)
+                if state.hc2_corrector_fired:
+                    step_rec["hc2_corrector_fired"] = True
+                if state.hc2_free_corr >= 0.0:
+                    step_rec["hc2_free_corr_delta"] = round(state.hc2_free_corr, 6)
             step_rec["model_calls"] = debug_counters["model_calls"]
             step_rec["dyn_thresh_fired_calls"] = debug_counters["dt_fired"]
             stats = _dbg_tensor_stats(x_next)
@@ -1920,10 +2105,18 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
         rec.meta["final_x_stats"] = _dbg_tensor_stats(x)
 
 
+    # Wide guard against real blowups, not a tone control. It used to be a
+    # fixed +-7 (EDM) / +-20 (FM), which is right for a finished image but
+    # clips a latent that is handed on still noisy - a SplitSigmas head, or
+    # the first KSampler of a two-stage workflow - so the bound now grows
+    # with the noise the output legitimately carries. Ending at sigma = 0 it
+    # is exactly the old bound.
+    sigma_end = max(float(sigmas_work[-1]), 0.0)
     if is_edm:
-        x = torch.clamp(x, -7.0, 7.0)
+        final_bound = 7.0 + 5.0 * sigma_end
     else:
-        x = torch.clamp(x, -20.0, 20.0)
+        final_bound = 20.0 + 5.0 * noise_scale * sigma_end
+    x = torch.clamp(x, -final_bound, final_bound)
 
     # torch.clamp leaves NaN untouched, so a run that blew up used to finish
     # quietly and look like any other result. In debug_mode - the measurement
@@ -2070,7 +2263,7 @@ class DDRKOmegaSamplerNode:
                 }),
                 "momentum_beta": ("FLOAT", {
                     "default": 0.25, "min": 0.0, "max": 0.8, "step": 0.05,
-                    "tooltip": "Velocity EMA. Reduces oscillation. 0 = disabled."
+                    "tooltip": "Adams-Bashforth 2 slope extrapolation for EULER steps only (1.0 = full AB2, a second-order method at one call per step). 0 = plain Euler. Ignored by heun, rk4 and hc2: on top of a higher-order method it makes it first order (measured: RK4 error ~250x, Heun 3-5x at 128-256 calls), so since 1.10.0 it is no longer applied there."
                 }),
                 "sde_seed": ("INT", {
                     "default": -1, "min": -1, "max": 0xffffffffffffffff,
@@ -2098,7 +2291,7 @@ class DDRKOmegaSamplerNode:
                 }),
                 "auto_optimize": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Auto-disable SABER/SDE/momentum and force euler for FM few-step. Does NOT set steps/cfg."
+                    "tooltip": "Flow Matching only: caps or disables SABER/SDE/momentum/sharpness by step budget, and at <=10 steps turns integrator 'auto' into 'hc2'. Does NOT set steps/cfg or the schedule."
                 }),
                 "debug_mode": ("BOOLEAN", {
                     "default": False,
@@ -2107,6 +2300,16 @@ class DDRKOmegaSamplerNode:
                 "debug_tag": ("STRING", {
                     "default": "",
                     "tooltip": "Optional label included in the debug log filename, e.g. 'test1'."
+                }),
+            },
+            "optional": {
+                "hc2_space": (["ve", "flow"], {
+                    "default": "ve",
+                    "tooltip": "HC2 time variable on Flow Matching. ve (default): lambda = -log(sigma), as HC2 always was. flow: the exact FM parameterisation, half-log-SNR log((1-sigma)/sigma) with a (1-sigma) weight on the correction. MEASURED (Anima, CFG 4, 25 steps, 2 seeds, distance to an RK4 reference): a draw - better on one seed, worse on the other - so it is opt-in. No effect on EDM, where both are the same."
+                }),
+                "hc2_free_corrector": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "HC2 zero-cost corrector (UniPC-style). Off by default. After each HC2 step the model is called at the step's end point anyway, for the next step; with this on, that output is also used to redo the finished step by interpolation instead of extrapolation, then the next step proceeds from the corrected latent. No extra model calls. MEASURED on the analytic bench only (tests/analytic.py, equal calls): EDM Karras 20-32 calls, error 3-3.6x lower than plain HC2; Flow Matching with the model's schedule, a few percent, because the final jump to sigma 0 dominates there. NOT validated on images - A/B it before relying on it. Ignored by other integrators and on steps that follow SDE noise, churn or a restart jump."
                 }),
             }
         }
@@ -2118,7 +2321,8 @@ class DDRKOmegaSamplerNode:
     def get_sampler(self, integrator, sde_strength, sharpness, saber_fusion,
                     saber_mode, use_ema_saber, ema_decay, dyn_thresh_percentile,
                     latent_rescale, limiter_kappa, restart_repeats, restart_steps, restart_t_min, restart_t_max, hc2_corrector, sigma_adapt, hc2_max_order, momentum_beta, sde_seed, s_churn, s_tmin, s_tmax,
-                    s_noise, content_aware, auto_optimize, debug_mode=False, debug_tag=""):
+                    s_noise, content_aware, auto_optimize, debug_mode=False, debug_tag="",
+                    hc2_space="ve", hc2_free_corrector=False):
         extra = {
             "integrator": integrator,
             "sde_strength": sde_strength,
@@ -2131,6 +2335,7 @@ class DDRKOmegaSamplerNode:
             "limiter_kappa": limiter_kappa,
             "hc2_max_order": hc2_max_order,
             "hc2_corrector": hc2_corrector,
+            "hc2_free_corrector": hc2_free_corrector,
             "sigma_adapt": sigma_adapt,
             "restart_repeats": restart_repeats,
             "restart_steps": restart_steps,
@@ -2147,6 +2352,7 @@ class DDRKOmegaSamplerNode:
             "auto_optimize": auto_optimize,
             "debug_mode": debug_mode,
             "debug_tag": debug_tag,
+            "hc2_space": hc2_space,
         }
         sampler = comfy.samplers.KSAMPLER(sample_ddrk_omega, extra_options=extra)
         return (sampler,)
@@ -2221,7 +2427,7 @@ class DDRKOmegaUnifiedKSamplerNode:
                     "tooltip": "Shape parameter B, used only by ddrk_beta. Raising B above ~2 shifts resolution toward high sigma and leaves a large final step, which is usually undesirable. A=2, B=1 gives Karras-like monotonically shrinking steps."}),
                 "auto_optimize": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Auto-disable SABER/SDE/momentum and force euler for FM few-step. Does NOT set steps/cfg."
+                    "tooltip": "Flow Matching only: caps or disables SABER/SDE/momentum/sharpness by step budget, and at <=10 steps turns integrator 'auto' into 'hc2'. Does NOT set steps/cfg or the schedule."
                 }),
                 "smart_defaults": ("BOOLEAN", {
                     "default": False,
@@ -2268,7 +2474,8 @@ class DDRKOmegaUnifiedKSamplerNode:
                     "default": 1.0, "min": 0.1, "max": 3.0, "step": 0.05,
                     "tooltip": "HC2 slope limiter. Caps the 2nd-order correction at this multiple of the 1st-order step, per element. MEASURED (Anima, CFG 5, 3 seeds): the control responds monotonically - kappa 3.0 clips 2.1% of elements on average, 1.0 clips 6.1%, 0.5 clips 11.8%. By dynamic range the default 1.0 came out best, 0.5 worst (-1.6%). Note the original premise was only partly borne out: going from CFG 1 to CFG 5 raised correction activity by ~57%, not by the order of magnitude that would make aggressive limiting necessary. Leave at 1.0 unless you see overshoot. Ignored by every other integrator."
                 }),
-                "momentum_beta": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 0.8, "step": 0.05}),
+                "momentum_beta": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 0.8, "step": 0.05,
+                    "tooltip": "Adams-Bashforth 2 slope extrapolation for EULER steps only. 0 = plain Euler. Ignored by heun, rk4 and hc2 since 1.10.0: on a higher-order method it makes it first order (measured: RK4 error ~250x, Heun 3-5x)."}),
                 "sde_seed": ("INT", {
                     "default": -1, "min": -1, "max": 0xffffffffffffffff,
                     "tooltip": "SDE noise seed. -1 derives the seed from ComfyUI's globally seeded Torch RNG, so the workflow seed remains reproducible."
@@ -2317,6 +2524,10 @@ class DDRKOmegaUnifiedKSamplerNode:
                     "default": 5, "min": 1, "max": 50,
                     "tooltip": "Model calls spent on the second pass (steps actually run at refine_denoise)."
                 }),
+                "hc2_free_corrector": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "HC2 zero-cost corrector (UniPC-style). Off by default. After each HC2 step the model is called at the step's end point anyway, for the next step; with this on, that output is also used to redo the finished step by interpolation instead of extrapolation, then the next step proceeds from the corrected latent. No extra model calls. MEASURED on the analytic bench only (tests/analytic.py, equal calls): EDM Karras 20-32 calls, error 3-3.6x lower than plain HC2; Flow Matching with the model's schedule, a few percent, because the final jump to sigma 0 dominates there. NOT validated on images - A/B it before relying on it. Ignored by other integrators and on steps that follow SDE noise, churn or a restart jump."
+                }),
             }
         }
 
@@ -2334,7 +2545,8 @@ class DDRKOmegaUnifiedKSamplerNode:
                s_tmax=999999.0, s_noise=1.0, content_aware=True,
                beta_a=2.0, beta_b=1.0,
                debug_mode=False, debug_tag="", hc2_space="ve",
-               refine_scale=1.0, refine_denoise=0.35, refine_steps=5):
+               refine_scale=1.0, refine_denoise=0.35, refine_steps=5,
+               hc2_free_corrector=False):
         # Snapshot BEFORE smart_defaults rewrites anything: the second pass
         # re-enters with exactly what the user asked for.
         call_args = {k: v for k, v in locals().items() if k != "self"}
@@ -2406,7 +2618,10 @@ class DDRKOmegaUnifiedKSamplerNode:
             model_sampling=ms,
         )
 
-        noise = comfy.sample.prepare_noise(latent_samples, seed, None)
+        # batch_index (from latent batch nodes) picks which noise each item
+        # gets, exactly as the stock KSampler does.
+        noise = comfy.sample.prepare_noise(latent_samples, seed,
+                                           latent.get("batch_index", None))
 
         if denoise < 1.0:
             sigmas = sigmas[-(steps_denoised + 1):]
@@ -2436,6 +2651,7 @@ class DDRKOmegaUnifiedKSamplerNode:
             "limiter_kappa": limiter_kappa,
             "hc2_max_order": hc2_max_order,
             "hc2_corrector": hc2_corrector,
+            "hc2_free_corrector": hc2_free_corrector,
             "sigma_adapt": sigma_adapt,
             "restart_repeats": restart_repeats,
             "restart_steps": restart_steps,
@@ -2495,7 +2711,11 @@ class DDRKOmegaUnifiedKSamplerNode:
               f"{list(up.shape[-2:])}, denoise {call_args['refine_denoise']:.2f}, "
               f"{int(call_args['refine_steps'])} steps")
         args = dict(call_args)
-        args.update(latent_image={"samples": up}, refine_scale=1.0,
+        # Keep the rest of the latent dict: noise_mask (inpainting - the mask
+        # is resized to the new canvas when sampling) and batch_index. Up to
+        # 1.9.0 the second pass dropped them and redrew masked-out regions.
+        args.update(latent_image={**call_args["latent_image"], "samples": up},
+                    refine_scale=1.0,
                     denoise=float(call_args["refine_denoise"]),
                     steps=int(call_args["refine_steps"]))
         if args.get("debug_tag"):
