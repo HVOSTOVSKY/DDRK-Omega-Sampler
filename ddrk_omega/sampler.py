@@ -1,5 +1,5 @@
 """
-DDRK Omega Sampler v1.10.0
+DDRK Omega Sampler v1.11.0
 ComfyUI | Flow Matching + EDM Universal Sampler
 https://github.com/HVOSTOVSKY/DDRK-Omega-Sampler
 """
@@ -72,6 +72,9 @@ class SamplerState:
     # needs to be corrected once the denoiser at its end point is known.
     hc2_pc: Optional[Dict[str, Any]] = None
     hc2_free_corr: float = -1.0
+
+    # HC3: mean extrapolation trust of the last step (telemetry only).
+    hc3_theta: float = -1.0
 
     # False skips the diagnostics that need a GPU->CPU sync (limiter
     # fraction, activity) when nothing reads them.
@@ -160,10 +163,17 @@ def _detect_model_profile(model, latent_samples=None) -> dict:
     family = "unknown"
     image_model = None
     guidance_embed = False
+    model_class = ""
     try:
 
         inner_model = getattr(model, "model", None)
         cfg = getattr(inner_model, "model_config", {}) if inner_model is not None else {}
+        # ComfyUI's supported_models class (SD15, SDXL, SD3, Flux,
+        # FluxSchnell, QwenImage, ...): the most direct statement of what the
+        # model is, and the only one for families whose unet_config carries
+        # no image_model.
+        if cfg is not None and not isinstance(cfg, dict):
+            model_class = type(cfg).__name__
         unet = {}
         if isinstance(cfg, dict):
             unet = cfg.get("unet_config", {})
@@ -203,7 +213,16 @@ def _detect_model_profile(model, latent_samples=None) -> dict:
                 elif "lumina" in im:
                     family = "lumina"
                 else:
-                    family = "fm"
+                    # An image_model this table does not know. Cosmos,
+                    # PixArt, Hunyuan-DiT and CogVideoX are EDM-type, so
+                    # the sigma range decides, not the mere presence of
+                    # the key (up to 1.10.0 every one of them became "fm").
+                    family = "edm" if is_edm else "fm"
+            elif model_class.startswith("SD3"):
+                # SD3 / SD3.5 have no image_model and no context_dim, so up
+                # to 1.10.0 they fell through to the 16-channel heuristic
+                # and were reported as Flux.
+                family = "sd3"
             else:
 
                 if adm == 2816:
@@ -233,7 +252,7 @@ def _detect_model_profile(model, latent_samples=None) -> dict:
             family = "fm"
 
 
-    print(f"[DDRK Detect] raw_image_model={image_model!r}, family={family}, "
+    print(f"[DDRK Detect] model_class={model_class or '?'}, raw_image_model={image_model!r}, family={family}, "
           f"guidance_embed={guidance_embed}, is_edm={is_edm}, latent_ch={latent_ch}, "
           f"detected_by={detected_by}")
     for w in detect_warnings:
@@ -271,18 +290,18 @@ def _detect_model_profile(model, latent_samples=None) -> dict:
             flow_shift=1.0,
 
 
-            # hc2, not auto: on FM it was the most accurate integrator at
-            # equal model calls in the 1.9.0 image A/B (Anima, CFG 4), and it
-            # is what Lite uses. auto spends 2-4 calls per step in phase 1.
-            integrator="hc2",
+            # hc3: HC2 (the most accurate at equal model calls in the 1.9.0
+            # image A/B on FM) plus trust damping and the zero-cost corrector,
+            # same one call per step. auto spends 2-4 calls per step early.
+            integrator="hc3",
             sde_strength=0.0,
             sharpness=0.10,
             saber_fusion=0.0,
             momentum_beta=0.0,
             hint=(f"{family.upper()}: Flow Matching. Steps/CFG vary wildly by checkpoint. "
                   f"{'Guidance embed detected — distilled variant, try CFG≈1.0, steps 4-8. ' if guidance_embed else ''}"
-                  f"Check your model card. Integrator: hc2 (one model call per step; "
-                  f"the most accurate at equal calls in the 1.9.0 image A/B). "
+                  f"Check your model card. Integrator: hc3 (one model call per step, "
+                  f"third order, self-damping at high CFG). "
                   f"Use the model's native resolution (~1 MP)."),
         )
     elif family == "fm":
@@ -290,7 +309,7 @@ def _detect_model_profile(model, latent_samples=None) -> dict:
             scheduler_type="ddrk_auto",
             flow_shift=1.5,
 
-            integrator="hc2",
+            integrator="hc3",
             sde_strength=0.0,
             sharpness=0.12,
             saber_fusion=0.0,
@@ -313,6 +332,7 @@ def _detect_model_profile(model, latent_samples=None) -> dict:
         )
 
     profile["family"] = family
+    profile["model_class"] = model_class
     profile["guidance_embed"] = guidance_embed
     profile["detected_by"] = detected_by
     profile["detect_warnings"] = detect_warnings
@@ -706,10 +726,50 @@ def _hc2_free_correction(pc: Dict[str, Any], denoised: torch.Tensor,
     return corr - applied if applied is not None else corr
 
 
+def _hc3_trust(r: torch.Tensor, state: SamplerState) -> Optional[torch.Tensor]:
+    """HC3's extrapolation trust, per batch item, in [0, 1].
+
+    HC2 extrapolates the denoiser across the next step with the slope r of
+    its last two evaluations. That is second order when the trajectory is
+    resolved and an overshoot when it is not - high CFG at few steps, where
+    the guided denoiser swings between evaluations. On the analytic bench at
+    CFG 6 and 5-10 model calls every multistep method, HC2 included, was
+    1.2-4.5x less accurate than plain Euler for exactly this reason.
+
+    The slope history says which case applies. When r agrees with the slope
+    before it, the linear model of D is holding; when it has turned or
+    jumped, it is not. With rho = |r - r_prev| / (|r| + |r_prev|) (norms per
+    batch item), theta = 1 - rho scales the extrapolation: ~1 on a smooth
+    trajectory, where rho is O(h) and the method keeps its order, and ~0 when
+    consecutive slopes disagree, where the step falls back to DDIM - exact
+    for a denoiser that is constant over the step. A causal, per-image
+    version of the "lower order when unsure" rule that DPM-Solver and UniPC
+    apply only by step index.
+    """
+    if (state.hc2_D_prev is None or state.hc2_D_prev2 is None
+            or state.hc2_lambda_prev is None or state.hc2_lambda_prev2 is None):
+        return None
+    h_b = state.hc2_lambda_prev - state.hc2_lambda_prev2
+    if abs(h_b) < 1e-8:
+        return None
+    r_prev = (state.hc2_D_prev - state.hc2_D_prev2) / h_b
+    dims = tuple(range(1, r.dim()))
+    n_r = torch.linalg.vector_norm(r, dim=dims, keepdim=True)
+    n_p = torch.linalg.vector_norm(r_prev, dim=dims, keepdim=True)
+    n_d = torch.linalg.vector_norm(r - r_prev, dim=dims, keepdim=True)
+    theta = (1.0 - n_d / (n_r + n_p).clamp_min(1e-12)).clamp(0.0, 1.0)
+    if state.hc2_stats:
+        try:
+            state.hc3_theta = float(theta.mean().item())
+        except Exception:
+            state.hc3_theta = -1.0
+    return theta
+
+
 def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
              momentum_beta: float = None, limiter_kappa: float = 1.0,
              max_order: int = 2, corrector_thresh: float = 0.0,
-             free_corrector: bool = False):
+             free_corrector: bool = False, damping: bool = False):
     s = _safe_sigma(sigma)
     sigma_next_f = float(sigma_next)
 
@@ -720,6 +780,7 @@ def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
 
     pc, state.hc2_pc = state.hc2_pc, None
     state.hc2_free_corr = -1.0
+    state.hc3_theta = -1.0
     # On the final step the output is the denoiser itself, so correcting x
     # there would change nothing.
     if free_corrector and pc is not None and sigma_next_f > 1e-7:
@@ -786,6 +847,12 @@ def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
 
     elif has_1 and abs(h_prev) > 1e-8:
         r = (denoised - state.hc2_D_prev) / h_prev
+        r_raw = r
+        theta = None
+        if damping:
+            theta = _hc3_trust(r, state)
+            if theta is not None:
+                r = r * theta
         corr2 = r * (alpha_next * ((h - 1.0) + exp_neg_h))
         correction = corr2
         order_used = 2
@@ -798,7 +865,10 @@ def hc2_step(x, sigma, sigma_next, model_fn, state: SamplerState,
 
 
                 d_prev = (state.hc2_D_prev - state.hc2_D_prev2) / h_prev2
-                dd = (r - d_prev) / (h_prev + h_prev2)
+                dd = (r_raw - d_prev) / (h_prev + h_prev2)
+                if theta is not None:
+                    # Curvature is a difference of slopes: trust it less.
+                    dd = dd * (theta * theta)
                 corr3 = dd * (alpha_next * ((h * h - 2.0 * h + 2.0)
                                             - 2.0 * exp_neg_h
                                             + h_prev * ((h - 1.0) + exp_neg_h)))
@@ -1110,7 +1180,7 @@ def _flow_shift(t: torch.Tensor, shift: float) -> torch.Tensor:
 
 
 _KNOWN_SCHEDULERS = frozenset({
-    "ddrk_auto", "ddrk_model",
+    "ddrk_auto", "ddrk_model", "ddrk_model_beta",
     "ddrk_flow_linear", "ddrk_cosine", "ddrk_beta",
     "ddrk_fewstep", "ddrk_flow_cosmos",
     "ddrk_edm_karras", "ddrk_edm_simple", "ddrk_edm_poly",
@@ -1135,22 +1205,31 @@ def _resolve_scheduler_name(scheduler_type: str, is_edm: bool) -> str:
     return scheduler_type
 
 
-def _model_sigmas(model_sampling, steps: int, device) -> Optional[torch.Tensor]:
-    """The model's own schedule: comfy.samplers.calculate_sigmas(ms, "simple").
+def _model_sigmas(model_sampling, steps: int, device,
+                  comfy_name: str = "simple") -> Optional[torch.Tensor]:
+    """A schedule on the model's own sigma table, via
+    comfy.samplers.calculate_sigmas(ms, comfy_name): "simple" for ddrk_model,
+    "beta" for ddrk_model_beta.
 
     Returns None (and says why) when it cannot be built, so the caller can
     fall back loudly instead of silently substituting another schedule.
     """
+    label = "ddrk_model" if comfy_name == "simple" else f"ddrk_model_{comfy_name}"
     if model_sampling is None:
-        print("[DDRK] ddrk_model: no model_sampling was passed to "
+        print(f"[DDRK] {label}: no model_sampling was passed to "
               "get_ddrk_sigmas, so the model's own shift is unknown.")
         return None
     calc = getattr(comfy.samplers, "calculate_sigmas", None)
     if calc is None:
-        print("[DDRK] ddrk_model: comfy.samplers.calculate_sigmas is missing "
+        print(f"[DDRK] {label}: comfy.samplers.calculate_sigmas is missing "
               "in this ComfyUI build.")
         return None
-    sigmas = calc(model_sampling, "simple", steps)
+    try:
+        sigmas = calc(model_sampling, comfy_name, steps)
+    except Exception as e:
+        print(f"[DDRK] {label}: ComfyUI's '{comfy_name}' scheduler failed "
+              f"({type(e).__name__}: {e}).")
+        return None
     sigmas = torch.as_tensor(sigmas).to(device=device, dtype=torch.float32)
     # simple_scheduler indexes a finite sigma table; on a table shorter than
     # the step count it repeats entries. A repeated sigma is a zero-length
@@ -1158,7 +1237,7 @@ def _model_sigmas(model_sampling, steps: int, device) -> Optional[torch.Tensor]:
     ok = (len(sigmas) == steps + 1 and float(sigmas[-1]) == 0.0
           and bool(((sigmas[:-1] - sigmas[1:]) > 0).all()))
     if not ok:
-        print(f"[DDRK] ddrk_model: the model's 'simple' schedule for {steps} "
+        print(f"[DDRK] {label}: the model's '{comfy_name}' schedule for {steps} "
               f"steps is not strictly decreasing to zero "
               f"({[round(float(v), 4) for v in sigmas.tolist()]}).")
         return None
@@ -1193,6 +1272,20 @@ def get_ddrk_sigmas(scheduler_type: str, steps: int, sigma_min: float,
     if scheduler_type == "ddrk_auto":
         # Only EDM reaches here; FM ddrk_auto was resolved to ddrk_model above.
         scheduler_type = "ddrk_edm_karras"
+
+    if scheduler_type == "ddrk_model_beta":
+        # ComfyUI's beta scheduler (alpha = beta = 0.6) on the model's own
+        # sigma table: the model's shift is kept, but the steps crowd towards
+        # both ends. On the analytic bench (tests/bench_analytic.py) the
+        # final jump to sigma 0 - the largest single error on Flow Matching -
+        # shrank 1.6-3.8x at equal steps (last sigma 0.114 vs 0.25 at 10
+        # steps), and the error to the exact solution fell 2-4x. Popular for Flux in
+        # the community; not yet A/B-tested on images in this project.
+        model_sched = _model_sigmas(model_sampling, steps, device, "beta")
+        if model_sched is not None:
+            return model_sched
+        print("[DDRK] ddrk_model_beta unavailable; using ddrk_model instead.")
+        scheduler_type = "ddrk_model"
 
     if scheduler_type == "ddrk_model":
         model_sched = _model_sigmas(model_sampling, steps, device)
@@ -1324,7 +1417,7 @@ def _resolve_effective_params(total_steps: int, is_edm: bool, auto_optimize: boo
                 f"[DDRK Auto] FM mid-step ({total_steps} steps): "
                 f"SABER<=0.05, SDE=0, momentum<=0.10, sharp<=0.15")
 
-    if total_steps <= 6 and integrator != "hc2":
+    if total_steps <= 6 and integrator not in ("hc2", "hc3"):
 
 
         # This rule fires whatever auto_optimize says. Elysium's "best" on
@@ -1362,6 +1455,13 @@ def _integrator_step(chosen_integrator: str, x: torch.Tensor, sigma_curr, sigma_
                         momentum_beta=momentum_beta, limiter_kappa=limiter_kappa,
                         max_order=hc2_max_order, corrector_thresh=hc2_corrector,
                         free_corrector=hc2_free_corrector)
+    if chosen_integrator == "hc3":
+        # HC3 = HC2's predictor with trust damping (_hc3_trust) plus the
+        # zero-cost corrector: third order at one model call per step.
+        return hc2_step(x, sigma_curr, sigma_target, model_fn, state,
+                        momentum_beta=momentum_beta, limiter_kappa=limiter_kappa,
+                        max_order=hc2_max_order, corrector_thresh=hc2_corrector,
+                        free_corrector=True, damping=True)
     if chosen_integrator == "rk4":
         out = rk4_step(x, sigma_curr, sigma_target, model_fn, state, momentum_beta=momentum_beta)
     elif chosen_integrator == "heun":
@@ -1376,7 +1476,7 @@ def _integrator_step(chosen_integrator: str, x: torch.Tensor, sigma_curr, sigma_
         # stopped run, so this raises.
         raise ValueError(
             f"Unknown integrator {chosen_integrator!r}. "
-            f"Expected one of: auto, euler, heun, rk4, hc2."
+            f"Expected one of: auto, euler, heun, rk4, hc2, hc3."
         )
     # Feed the denoiser value at this step's start into HC2's history. Only
     # auto mode mixes integrators, so a pinned euler/heun/rk4 run never reads
@@ -2047,7 +2147,7 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
         else:
             state.curvature = 0.0
 
-        if (sigma_adapt > 0.0 and chosen_integrator == "hc2"
+        if (sigma_adapt > 0.0 and chosen_integrator in ("hc2", "hc3")
                 and state.hc2_activity > 0.0 and i + 2 < len(sigmas_work) - 1):
             activity_sum += state.hc2_activity
             activity_n += 1
@@ -2062,7 +2162,9 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
             step_rec["curvature"] = state.curvature if integrator == "auto" and phase == 1 else None
             # HC2's fields persist between its steps; in auto mode only log
             # them on steps HC2 actually took.
-            if chosen_integrator == "hc2":
+            if chosen_integrator in ("hc2", "hc3"):
+                if state.hc3_theta >= 0.0:
+                    step_rec["hc3_trust"] = round(state.hc3_theta, 5)
                 if state.hc2_limited_frac >= 0.0:
                     step_rec["hc2_limiter_frac"] = round(state.hc2_limited_frac, 5)
                 if state.hc2_order_used:
@@ -2145,6 +2247,8 @@ def sample_ddrk_omega(model, x, sigmas, extra_args=None, callback=None,
 
 
 class DDRKOmegaSchedulerNode:
+    DESCRIPTION = ('DDRK sigma schedules as a SIGMAS output, for SamplerCustom / SamplerCustomAdvanced. ddrk_auto picks the right one for the model family.')
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -2154,6 +2258,7 @@ class DDRKOmegaSchedulerNode:
                 "scheduler_type": ([
                     "ddrk_auto",
                     "ddrk_model",
+                    "ddrk_model_beta",
                     "ddrk_cosine",
                     "ddrk_beta",
                     "ddrk_flow_linear",
@@ -2163,7 +2268,7 @@ class DDRKOmegaSchedulerNode:
                     "ddrk_edm_poly",
                     "ddrk_edm_simple",
                 ], {"default": "ddrk_auto",
-                    "tooltip": "ddrk_auto: EDM -> ddrk_edm_karras; Flow Matching -> ddrk_model (since 1.8.0; was ddrk_cosine). ddrk_model = the model's own 'simple' schedule, so the shift comes from the model (and any ModelSampling* node in the graph); flow_shift is ignored."}),
+                    "tooltip": "ddrk_auto: EDM -> ddrk_edm_karras; Flow Matching -> ddrk_model (since 1.8.0; was ddrk_cosine). ddrk_model = the model's own 'simple' schedule, so the shift comes from the model (and any ModelSampling* node in the graph); flow_shift is ignored. ddrk_model_beta = ComfyUI's 'beta' on the same table: same shift, steps denser at both ends, a much smaller final jump (analytic bench: 2-4x less error on FM; not yet image-tested)."}),
                 "flow_shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 10.0, "step": 0.1,
                     "tooltip": "Used by the ddrk_flow_*/cosine/beta/cosmos schedules only. ddrk_model and FM ddrk_auto take the shift from the model."}),
                 "warmup_steps": ("INT", {"default": 0, "min": 0, "max": 5}),
@@ -2180,7 +2285,7 @@ class DDRKOmegaSchedulerNode:
 
     RETURN_TYPES = ("SIGMAS",)
     FUNCTION = "get_sigmas"
-    CATEGORY = "sampling/custom_schedulers"
+    CATEGORY = "sampling/DDRK Omega/custom sampling"
 
     def get_sigmas(self, model, steps, scheduler_type, flow_shift, warmup_steps,
                    auto_optimize, beta_a=2.0, beta_b=1.0):
@@ -2198,21 +2303,24 @@ class DDRKOmegaSchedulerNode:
 
 
 class DDRKOmegaSamplerNode:
+    DESCRIPTION = ('The DDRK sampler as a SAMPLER output, for SamplerCustom / SamplerCustomAdvanced. For a one-node setup use DDRK Omega Auto or Lite instead.')
+
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "integrator": (["auto", "hc2", "rk4", "heun", "euler"], {"default": "auto"}),
+                "integrator": (["auto", "hc3", "hc2", "rk4", "heun", "euler"], {"default": "hc3",
+                    "tooltip": "hc3 (recommended): HC2 plus trust damping and a zero-cost corrector - third order at one model call per step, and it falls back towards first order by itself where high CFG makes extrapolation unsafe. hc2: second order, one call per step (the 1.6-1.10 default for FM). euler: first order, one call. heun: 2 calls per step. rk4: 4 calls per step. auto: per-phase choice (heun/rk4 early, hc2 late; 1-4 calls per step). Compare integrators at equal MODEL CALLS, not equal steps."}),
                 "sde_strength": ("FLOAT", {
-                    "default": 0.08, "min": 0.0, "max": 0.5, "step": 0.01,
+                    "default": 0.0, "min": 0.0, "max": 0.5, "step": 0.01,
                     "tooltip": "Ancestral SDE noise, gated to flat regions. 0 = fully deterministic. FM only - ignored on EDM, which uses s_churn. MEASURED (Krea2 Turbo, 8 steps, 3 seeds): 0.00, 0.08 and 0.15 were indistinguishable by dynamic range (within 0.2%); 0.30 widened it 3.6%. The operator saw no quality change at any setting, only a different composition - which is what stochastic sampling does, it moves to a different sample rather than a better one. Treat this as a variation dial, not a quality dial."
                 }),
                 "sharpness": ("FLOAT", {
-                    "default": 0.30, "min": 0.0, "max": 1.5, "step": 0.01,
+                    "default": 0.0, "min": 0.0, "max": 1.5, "step": 0.01,
                     "tooltip": "Final-step perceptual sharpen. FM only - disabled on EDM by design, so it does nothing there. MEASURED (Krea2 Turbo, 8 steps, 3 seeds): 0.10 widened dynamic range 2.6%, 0.12 widened it 3.2%, both consistent across seeds, and the operator saw a clear sharpness increase. The effect had NOT saturated at the point where an inherited cap used to cut it off, so values above 0.12 are now reachable and genuinely untested - halos and edge ringing are the failure mode to watch for."
                 }),
                 "saber_fusion": ("FLOAT", {
-                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Spatial stabilization (a gated blur). 0 disables the module entirely. MEASURED (Krea2 Turbo, 8 steps, 3 seeds): this consistently NARROWS dynamic range - 0.10 by 0.4%, 0.15 by 0.8% - and the operator reported smoother shadows and a silkier look, but graininess appearing by 0.15. Every other measurement in this project has associated a narrower range with a softer, less detailed result, so treat this as a stylistic smoothing control with a real cost, not as a quality improvement. Turn it off for text, graphics and pixel art."
                 }),
                 "saber_mode": (["auto", "image", "video"], {
@@ -2262,7 +2370,7 @@ class DDRKOmegaSamplerNode:
                     "tooltip": "HC2 slope limiter. Caps the 2nd-order correction at this multiple of the 1st-order step, per element. MEASURED (Anima, CFG 5, 3 seeds): the control responds monotonically - kappa 3.0 clips 2.1% of elements on average, 1.0 clips 6.1%, 0.5 clips 11.8%. By dynamic range the default 1.0 came out best, 0.5 worst (-1.6%). Note the original premise was only partly borne out: going from CFG 1 to CFG 5 raised correction activity by ~57%, not by the order of magnitude that would make aggressive limiting necessary. Leave at 1.0 unless you see overshoot. Ignored by every other integrator."
                 }),
                 "momentum_beta": ("FLOAT", {
-                    "default": 0.25, "min": 0.0, "max": 0.8, "step": 0.05,
+                    "default": 0.0, "min": 0.0, "max": 0.8, "step": 0.05,
                     "tooltip": "Adams-Bashforth 2 slope extrapolation for EULER steps only (1.0 = full AB2, a second-order method at one call per step). 0 = plain Euler. Ignored by heun, rk4 and hc2: on top of a higher-order method it makes it first order (measured: RK4 error ~250x, Heun 3-5x at 128-256 calls), so since 1.10.0 it is no longer applied there."
                 }),
                 "sde_seed": ("INT", {
@@ -2316,7 +2424,7 @@ class DDRKOmegaSamplerNode:
 
     RETURN_TYPES = ("SAMPLER",)
     FUNCTION = "get_sampler"
-    CATEGORY = "sampling/custom_samplers"
+    CATEGORY = "sampling/DDRK Omega/custom sampling"
 
     def get_sampler(self, integrator, sde_strength, sharpness, saber_fusion,
                     saber_mode, use_ema_saber, ema_decay, dyn_thresh_percentile,
@@ -2359,6 +2467,8 @@ class DDRKOmegaSamplerNode:
 
 
 class DDRKOmegaSmartConfigNode:
+    DESCRIPTION = ('Shows what DDRK detects about a model (family, guidance embedding) and the settings it would recommend. Does not sample.')
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -2373,7 +2483,7 @@ class DDRKOmegaSmartConfigNode:
     RETURN_NAMES = ("family", "hint", "guidance_embed", "scheduler_type", "flow_shift", "integrator",
                     "sde_strength", "sharpness", "saber_fusion", "momentum_beta")
     FUNCTION = "detect"
-    CATEGORY = "sampling/custom_schedulers"
+    CATEGORY = "sampling/DDRK Omega/utils"
 
     def detect(self, model, latent_image):
         profile = _detect_model_profile(model, latent_image.get("samples"))
@@ -2386,6 +2496,8 @@ class DDRKOmegaSmartConfigNode:
 
 
 class DDRKOmegaUnifiedKSamplerNode:
+    DESCRIPTION = ('The full DDRK sampler with every control: schedules, integrators (HC3/HC2/RK4/Heun/Euler), SDE, churn, restarts, enhancers, second pass and telemetry. For everyday use start with DDRK Omega Auto.')
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -2400,24 +2512,25 @@ class DDRKOmegaUnifiedKSamplerNode:
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01,
                     "tooltip": "Denoise strength, as in the stock KSampler. Minimum is 0.01, not 0.0: denoise scales the step count via steps/denoise, so exactly 0.0 is a division by zero, and 0.0 denoise means 'do nothing' anyway."}),
                 "scheduler_type": ([
-                    "ddrk_auto", "ddrk_model", "ddrk_cosine", "ddrk_beta",
+                    "ddrk_auto", "ddrk_model", "ddrk_model_beta", "ddrk_cosine", "ddrk_beta",
                     "ddrk_flow_linear", "ddrk_flow_cosmos", "ddrk_fewstep",
                     "ddrk_edm_karras", "ddrk_edm_poly", "ddrk_edm_simple",
                 ], {"default": "ddrk_auto",
-                    "tooltip": "ddrk_auto: EDM -> ddrk_edm_karras; Flow Matching -> ddrk_model (since 1.8.0; was ddrk_cosine). ddrk_model = the model's own 'simple' schedule, so the shift comes from the model (and any ModelSampling* node in the graph); flow_shift and auto_flow_shift are ignored."}),
+                    "tooltip": "ddrk_auto: EDM -> ddrk_edm_karras; Flow Matching -> ddrk_model (since 1.8.0; was ddrk_cosine). ddrk_model = the model's own 'simple' schedule, so the shift comes from the model (and any ModelSampling* node in the graph); flow_shift and auto_flow_shift are ignored. ddrk_model_beta = ComfyUI's 'beta' on the same table: same shift, steps denser at both ends, a much smaller final jump (analytic bench: 2-4x less error on FM; not yet image-tested)."}),
                 "flow_shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 10.0, "step": 0.1,
                     "tooltip": "Used by the ddrk_flow_*/cosine/beta/cosmos schedules only. ddrk_model and FM ddrk_auto take the shift from the model."}),
                 "auto_flow_shift": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Derive flow_shift from the latent's token count instead of using the widget value, the way Flux/SD3 intend (shift should grow with image area). At 512x768 the derived value is ~2.05, at 1024x1024 ~3.16 - so a single fixed number cannot be right at both. FM only; ignored on EDM, and ignored by ddrk_model / FM ddrk_auto, which use the model's own shift. WARNING: if ModelSamplingFlux is already in your graph it applies the same shift at the model level and this would double it. Use one or the other. UNVALIDATED - no ablation yet."
                 }),
-                "integrator": (["auto", "hc2", "rk4", "heun", "euler"], {"default": "auto"}),
-                "sde_strength": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.5, "step": 0.01,
+                "integrator": (["auto", "hc3", "hc2", "rk4", "heun", "euler"], {"default": "hc3",
+                    "tooltip": "hc3 (recommended): HC2 plus trust damping and a zero-cost corrector - third order at one model call per step, and it falls back towards first order by itself where high CFG makes extrapolation unsafe. hc2: second order, one call per step (the 1.6-1.10 default for FM). euler: first order, one call. heun: 2 calls per step. rk4: 4 calls per step. auto: per-phase choice (heun/rk4 early, hc2 late; 1-4 calls per step). Compare integrators at equal MODEL CALLS, not equal steps."}),
+                "sde_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.5, "step": 0.01,
                     "tooltip": "Ancestral SDE noise, gated to flat regions. 0 = fully deterministic. FM only - ignored on EDM, which uses s_churn. MEASURED (Krea2 Turbo, 8 steps, 3 seeds): 0.00, 0.08 and 0.15 were indistinguishable by dynamic range (within 0.2%); 0.30 widened it 3.6%. The operator saw no quality change at any setting, only a different composition - which is what stochastic sampling does, it moves to a different sample rather than a better one. Treat this as a variation dial, not a quality dial."}),
-                "sharpness": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.5, "step": 0.01,
+                "sharpness": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.01,
                     "tooltip": "Final-step perceptual sharpen. FM only - disabled on EDM by design, so it does nothing there. MEASURED (Krea2 Turbo, 8 steps, 3 seeds): 0.10 widened dynamic range 2.6%, 0.12 widened it 3.2%, both consistent across seeds, and the operator saw a clear sharpness increase. The effect had NOT saturated at the point where an inherited cap used to cut it off, so values above 0.12 are now reachable and genuinely untested - halos and edge ringing are the failure mode to watch for."}),
                 "saber_fusion": ("FLOAT", {
-                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Spatial stabilization (a gated blur). 0 disables the module entirely. MEASURED (Krea2 Turbo, 8 steps, 3 seeds): this consistently NARROWS dynamic range - 0.10 by 0.4%, 0.15 by 0.8% - and the operator reported smoother shadows and a silkier look, but graininess appearing by 0.15. Every other measurement in this project has associated a narrower range with a softer, less detailed result, so treat this as a stylistic smoothing control with a real cost, not as a quality improvement. Turn it off for text, graphics and pixel art."
                 }),
                 "warmup_steps": ("INT", {"default": 0, "min": 0, "max": 5}),
@@ -2474,7 +2587,7 @@ class DDRKOmegaUnifiedKSamplerNode:
                     "default": 1.0, "min": 0.1, "max": 3.0, "step": 0.05,
                     "tooltip": "HC2 slope limiter. Caps the 2nd-order correction at this multiple of the 1st-order step, per element. MEASURED (Anima, CFG 5, 3 seeds): the control responds monotonically - kappa 3.0 clips 2.1% of elements on average, 1.0 clips 6.1%, 0.5 clips 11.8%. By dynamic range the default 1.0 came out best, 0.5 worst (-1.6%). Note the original premise was only partly borne out: going from CFG 1 to CFG 5 raised correction activity by ~57%, not by the order of magnitude that would make aggressive limiting necessary. Leave at 1.0 unless you see overshoot. Ignored by every other integrator."
                 }),
-                "momentum_beta": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 0.8, "step": 0.05,
+                "momentum_beta": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.8, "step": 0.05,
                     "tooltip": "Adams-Bashforth 2 slope extrapolation for EULER steps only. 0 = plain Euler. Ignored by heun, rk4 and hc2 since 1.10.0: on a higher-order method it makes it first order (measured: RK4 error ~250x, Heun 3-5x)."}),
                 "sde_seed": ("INT", {
                     "default": -1, "min": -1, "max": 0xffffffffffffffff,
@@ -2533,15 +2646,15 @@ class DDRKOmegaUnifiedKSamplerNode:
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
-    CATEGORY = "sampling/unified_samplers"
+    CATEGORY = "sampling/DDRK Omega"
 
     def sample(self, model, positive, negative, latent_image, seed, steps, cfg,
                denoise, scheduler_type, flow_shift, auto_flow_shift, integrator,
                sde_strength,
                sharpness, warmup_steps, auto_optimize, smart_defaults,
-               saber_fusion=0.30, saber_mode="auto", use_ema_saber=True,
+               saber_fusion=0.0, saber_mode="auto", use_ema_saber=True,
                ema_decay=0.7, dyn_thresh_percentile=1.0, latent_rescale=0.0, limiter_kappa=1.0, restart_repeats=0, restart_steps=3, restart_t_min=0.10, restart_t_max=0.35, hc2_corrector=0.0, sigma_adapt=0.0, hc2_max_order=2,
-               momentum_beta=0.25, sde_seed=-1, s_churn=0.0, s_tmin=0.0,
+               momentum_beta=0.0, sde_seed=-1, s_churn=0.0, s_tmin=0.0,
                s_tmax=999999.0, s_noise=1.0, content_aware=True,
                beta_a=2.0, beta_b=1.0,
                debug_mode=False, debug_tag="", hc2_space="ve",
@@ -2588,7 +2701,7 @@ class DDRKOmegaUnifiedKSamplerNode:
 
         resolved_scheduler = _resolve_scheduler_name(scheduler_type, sigma_max > 5.0)
         model_shift = False
-        if resolved_scheduler == "ddrk_model" and not (sigma_max > 5.0):
+        if resolved_scheduler in ("ddrk_model", "ddrk_model_beta") and not (sigma_max > 5.0):
             # The model's own schedule already carries its shift; deriving a
             # second one from the latent size would be ignored anyway, and
             # saying nothing would let a log claim a shift that was not used.
@@ -2810,6 +2923,8 @@ def _lite_sampler_params(is_edm: bool, quality: str, character: str,
 
 
 class DDRKOmegaLiteKSamplerNode(DDRKOmegaUnifiedKSamplerNode):
+    DESCRIPTION = ('DDRK with two dials (quality, character) on top of your own steps and CFG. Settings mapped to validated full-node values.')
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -2828,7 +2943,7 @@ class DDRKOmegaLiteKSamplerNode(DDRKOmegaUnifiedKSamplerNode):
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample_lite"
-    CATEGORY = "sampling/unified_samplers"
+    CATEGORY = "sampling/DDRK Omega"
 
     def sample_lite(self, model, positive, negative, latent_image, seed, steps,
                     cfg, quality, character):
@@ -2880,7 +2995,231 @@ class DDRKOmegaLiteKSamplerNode(DDRKOmegaUnifiedKSamplerNode):
         )
 
 
+# --------------------------------------------------------------------------
+# DDRK Omega Auto: one node, no sampler knowledge needed.
+# --------------------------------------------------------------------------
+
+# Starting values per model: (label, CFG, steps at "balanced"). Keyed by
+# ComfyUI's supported_models class name, the most reliable statement of what
+# the model is. They are the values the model makers and ComfyUI's own
+# templates use, not DDRK measurements; finetunes and LoRAs move them, which
+# is why the node prints what it chose and takes overrides.
+_AUTO_PRESETS = {
+    "SD15": ("SD 1.5", 7.0, 25),
+    "SD20": ("SD 2.x", 7.0, 25),
+    "SDXL": ("SDXL", 6.0, 25),
+    "SSD1B": ("SDXL (SSD-1B)", 6.0, 25),
+    "Segmind_Vega": ("SDXL (Vega)", 6.0, 25),
+    "KOALA_700M": ("SDXL (KOALA)", 6.0, 25),
+    "KOALA_1B": ("SDXL (KOALA)", 6.0, 25),
+    "SDXLRefiner": ("SDXL refiner", 5.0, 20),
+    "SD3": ("SD 3 / 3.5", 4.5, 28),
+    "AuraFlow": ("AuraFlow", 3.5, 25),
+    "PixArtAlpha": ("PixArt-alpha", 4.5, 20),
+    "PixArtSigma": ("PixArt-sigma", 4.5, 20),
+    "HunyuanDiT": ("Hunyuan-DiT", 6.0, 25),
+    "HunyuanDiT1": ("Hunyuan-DiT", 6.0, 25),
+    # Guidance-distilled: CFG 1, the strength comes from the FluxGuidance
+    # value in the conditioning (3.5 when none is set).
+    "Flux": ("Flux (guidance-distilled)", 1.0, 20),
+    "Flux2": ("Flux 2 (guidance-distilled)", 1.0, 24),
+    "Chroma": ("Chroma", 4.0, 26),
+    "Lumina2": ("Lumina 2", 4.0, 30),
+    "QwenImage": ("Qwen-Image", 2.5, 20),
+    "QwenImage21": ("Qwen-Image", 2.5, 20),
+    "HiDream": ("HiDream (dev settings)", 1.0, 28),
+    "Anima": ("Anima", 4.0, 25),
+    "WAN21_T2V": ("Wan (video)", 5.0, 25),
+    "WAN22_T2V": ("Wan (video)", 5.0, 25),
+    "WAN21_I2V": ("Wan (video)", 5.0, 25),
+    "LTXV": ("LTX-Video", 3.0, 30),
+    "HunyuanVideo": ("HunyuanVideo (embedded guidance)", 1.0, 25),
+    "CosmosT2V": ("Cosmos", 7.0, 35),
+    "CosmosT2IPredict2": ("Cosmos Predict2", 4.0, 35),
+}
+
+# Models that are few-step by construction: always sampled in turbo mode.
+_AUTO_FEW_STEP = {
+    "FluxSchnell": "Flux schnell",
+    "ZImage": "Z-Image Turbo",
+    "HunyuanVideo15_SR_Distilled": "HunyuanVideo 1.5 SR (distilled)",
+}
+
+_AUTO_TURBO_STEPS = {"fast": 4, "balanced": 6, "best": 8}
+_AUTO_STEP_SCALE = {"fast": 0.6, "balanced": 1.0, "best": 1.5}
+
+
+def _auto_settings(model, latent, quality: str, model_type: str,
+                   steps: int, cfg: float) -> dict:
+    """Everything the Auto node decides, as one dict (unit-testable)."""
+    if quality not in _AUTO_STEP_SCALE:
+        raise ValueError(f"Unknown quality {quality!r}.")
+    if model_type not in ("auto", "standard", "turbo / lightning / few-step"):
+        raise ValueError(f"Unknown model_type {model_type!r}.")
+    ms = model.get_model_object("model_sampling")
+    try:
+        import comfy.model_sampling as cms
+        is_edm = not isinstance(ms, cms.CONST)
+    except Exception:
+        is_edm = float(ms.sigma_max) > 5.0
+    inner = getattr(model, "model", None)
+    cfg_obj = getattr(inner, "model_config", None)
+    cls = type(cfg_obj).__name__ if cfg_obj is not None else ""
+
+    few_step = cls in _AUTO_FEW_STEP
+    turbo = few_step or model_type == "turbo / lightning / few-step"
+    if model_type == "standard":
+        turbo = False
+    if few_step:
+        label = _AUTO_FEW_STEP[cls]
+        base_cfg, base_steps = 1.0, 6
+    elif cls in _AUTO_PRESETS:
+        label, base_cfg, base_steps = _AUTO_PRESETS[cls]
+    else:
+        label = "EDM model" if is_edm else "Flow Matching model"
+        base_cfg, base_steps = (6.0, 25) if is_edm else (3.5, 24)
+    family = "EDM" if is_edm else "Flow Matching"
+
+    if turbo:
+        auto_steps, auto_cfg = _AUTO_TURBO_STEPS[quality], 1.0
+    else:
+        auto_steps = max(4, int(round(base_steps * _AUTO_STEP_SCALE[quality]))) \
+            if (is_edm or quality != "best") else base_steps
+        auto_cfg = base_cfg
+    use_steps = int(steps) if steps and steps > 0 else auto_steps
+    use_cfg = float(cfg) if cfg and cfg > 0 else auto_cfg
+
+    video = latent is not None and getattr(latent, "dim", lambda: 4)() == 5
+    refine = {}
+    # "best" on Flow Matching = the second pass, the one quality step the
+    # 1.9.0 image A/B confirmed (Krea 2 x3, Anima x2). Not on EDM (latent
+    # upscaling there was never A/B-tested), not on video, not in turbo mode.
+    if quality == "best" and not is_edm and not turbo and not video:
+        refine = _lite_refine(use_steps)
+
+    return {
+        "label": label, "family": family, "model_class": cls or "?",
+        "is_edm": is_edm, "turbo": turbo,
+        "steps": use_steps, "cfg": use_cfg,
+        "steps_auto": not (steps and steps > 0),
+        "cfg_auto": not (cfg and cfg > 0),
+        # Karras on EDM; in turbo mode the model's own schedule, whose 4
+        # steps land on the timesteps (999/749/499/249) that Lightning/Turbo
+        # style models are distilled at. Flow Matching: the model's own.
+        "scheduler": ("ddrk_model" if (is_edm and turbo) else "ddrk_auto"),
+        "integrator": "hc3",
+        **refine,
+    }
+
+
+def _auto_summary(st: dict, denoise: float) -> str:
+    def mark(auto):
+        return " (auto)" if auto else ""
+    sched = {"ddrk_auto": ("Karras" if st["is_edm"] else "model schedule"),
+             "ddrk_model": "model schedule"}[st["scheduler"]]
+    parts = [f"{st['label']} [{st['family']}]",
+             f"{st['steps']} steps{mark(st['steps_auto'])}",
+             f"CFG {st['cfg']:g}{mark(st['cfg_auto'])}",
+             f"HC3 integrator, {sched}"]
+    if st["turbo"]:
+        parts.append("turbo/few-step mode")
+    if denoise < 1.0:
+        parts.append(f"denoise {denoise:g}")
+    calls = st["steps"]
+    if st.get("refine_scale", 1.0) > 1.0:
+        parts.append(f"second pass {st['refine_scale']:g}x "
+                     f"({st['refine_steps']} steps, denoise {st['refine_denoise']:g})")
+        calls += st["refine_steps"]
+    parts.append(f"~{calls} model calls")
+    return "DDRK Omega Auto: " + " | ".join(parts)
+
+
+class DDRKOmegaAutoNode(DDRKOmegaUnifiedKSamplerNode):
+    DESCRIPTION = ("One-click DDRK sampling. Connect model, prompts and latent; the node "
+                   "recognises the model (SD 1.5, SDXL, SD3, Flux, Qwen-Image, Chroma, "
+                   "Wan and more) and chooses steps, CFG, schedule and integrator itself. "
+                   "The 'settings' output says exactly what it chose. Set steps or CFG "
+                   "above 0 to override them.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {}),
+                "positive": ("CONDITIONING", {}),
+                "negative": ("CONDITIONING", {}),
+                "latent_image": ("LATENT", {}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "control_after_generate": True}),
+                "quality": (["fast", "balanced", "best"], {"default": "balanced",
+                    "tooltip": "fast: ~0.6x the steps. balanced: the model's usual step count. "
+                               "best: EDM (SD/SDXL) 1.5x the steps; Flow Matching (Flux, SD3, Qwen...) "
+                               "adds a second pass at 1.33x resolution, ~1.7x the time and more VRAM."}),
+                "model_type": (["auto", "standard", "turbo / lightning / few-step"], {"default": "auto",
+                    "tooltip": "Pick 'turbo / lightning / few-step' for Turbo, Lightning, Hyper, LCM, "
+                               "DMD or schnell-style models and LoRAs: 4-8 steps at CFG 1. 'auto' "
+                               "recognises few-step base models (Flux schnell, Z-Image Turbo) but "
+                               "cannot see a turbo LoRA or finetune."}),
+                "steps": ("INT", {"default": 0, "min": 0, "max": 200,
+                    "tooltip": "0 = automatic for this model and quality. Anything above 0 is used as is."}),
+                "cfg": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.1,
+                    "tooltip": "0 = automatic for this model (e.g. SDXL 6, SD3 4.5, Flux 1). "
+                               "Anything above 0 is used as is."}),
+            },
+            "optional": {
+                "denoise": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01,
+                    "tooltip": "1.0 for text-to-image. Below 1.0 for img2img: how much of the input "
+                               "latent is redrawn."}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("latent", "settings")
+    OUTPUT_TOOLTIPS = ("The sampled latent - connect it to VAE Decode.",
+                       "What the node chose: model, steps, CFG, integrator, schedule.")
+    FUNCTION = "sample_auto"
+    CATEGORY = "sampling/DDRK Omega"
+
+    def sample_auto(self, model, positive, negative, latent_image, seed, quality,
+                    model_type, steps, cfg, denoise=1.0):
+        st = _auto_settings(model, latent_image.get("samples"), quality,
+                            model_type, steps, cfg)
+        summary = _auto_summary(st, float(denoise))
+        print(f"[DDRK] {summary}")
+        out = super().sample(
+            model, positive, negative, latent_image, seed, st["steps"], st["cfg"],
+            denoise=float(denoise),
+            scheduler_type=st["scheduler"],
+            flow_shift=3.0,
+            auto_flow_shift=False,
+            integrator=st["integrator"],
+            sde_strength=0.0,
+            sharpness=0.0,
+            warmup_steps=0,
+            auto_optimize=False,
+            smart_defaults=False,
+            saber_fusion=0.0,
+            dyn_thresh_percentile=1.0,
+            latent_rescale=0.0,
+            limiter_kappa=1.0,
+            restart_repeats=0,
+            hc2_corrector=0.0,
+            sigma_adapt=0.0,
+            hc2_max_order=2,
+            momentum_beta=0.0,
+            sde_seed=-1,
+            s_churn=0.0,
+            content_aware=True,
+            refine_scale=st.get("refine_scale", 1.0),
+            refine_denoise=st.get("refine_denoise", 0.35),
+            refine_steps=st.get("refine_steps", 5),
+        )
+        return (out[0], summary)
+
+
 class DDRKFluxConditioning:
+    DESCRIPTION = ('Inspect and reshape text conditioning: padding attenuation, token gain and norm equalisation. Prints what it did.')
+
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2920,7 +3259,7 @@ class DDRKFluxConditioning:
 
     RETURN_TYPES = ("CONDITIONING",)
     FUNCTION = "apply"
-    CATEGORY = "sampling/DDRK Omega"
+    CATEGORY = "sampling/DDRK Omega/utils"
 
     _LAYOUTS = {
         4096: "Flux.1 (T5-XXL, 4096)",
@@ -3009,6 +3348,7 @@ class DDRKFluxConditioning:
 
 
 NODE_CLASS_MAPPINGS = {
+    "DDRKOmegaAutoNode": DDRKOmegaAutoNode,
     "DDRKFluxConditioning": DDRKFluxConditioning,
     "DDRKOmegaSchedulerNode": DDRKOmegaSchedulerNode,
     "DDRKOmegaSamplerNode": DDRKOmegaSamplerNode,
@@ -3018,10 +3358,11 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "DDRKOmegaAutoNode": "DDRK Omega Auto (one-click)",
     "DDRKFluxConditioning": "DDRK Flux Conditioning",
     "DDRKOmegaSchedulerNode": "DDRK Omega Scheduler",
     "DDRKOmegaSamplerNode": "DDRK Omega Sampler",
-    "DDRKOmegaUnifiedKSamplerNode": "DDRK Omega Unified KSampler",
+    "DDRKOmegaUnifiedKSamplerNode": "DDRK Omega Unified KSampler (advanced)",
     "DDRKOmegaLiteKSamplerNode": "DDRK Omega Lite",
     "DDRKOmegaSmartConfigNode": "DDRK Omega Smart Config",
 }

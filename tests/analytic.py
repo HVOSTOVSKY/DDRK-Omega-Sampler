@@ -107,6 +107,44 @@ class DirectModel:
         return self.den(x, sigma)
 
 
+class GuidedDenoiser:
+    """Classifier-free guidance on two exact denoisers: Du + w (Dc - Du).
+
+    The uncond distribution is broader and differently placed, so at w > 1
+    the guided field swings the way a real high-CFG denoiser does - the
+    regime where extrapolating multistep methods overshoot. The guided ODE is
+    still an ordinary smooth ODE, so reference_solution gives its exact
+    solution.
+    """
+
+    def __init__(self, shape, flow: bool, w: float):
+        self.flow = flow
+        self.w = w
+        self.cond = MixtureDenoiser(shape, flow, stds=(0.25, 0.5))
+        self.uncond = MixtureDenoiser(shape, flow, seed=5, stds=(0.5, 0.9))
+
+    def __call__(self, x, sigma):
+        du = self.uncond(x, sigma)
+        return du + self.w * (self.cond(x, sigma) - du)
+
+
+def distribution_error(den: MixtureDenoiser, samples: torch.Tensor) -> float:
+    """How far samples are from the data distribution (an exact-problem FID).
+
+    Each element's true distribution is a known 1-D mixture, so its CDF maps
+    exact samples to Uniform(0, 1). Returns the mean |sorted CDF - uniform
+    quantile| (W1 to uniform): ~0 for exact samples, larger when a sampler
+    blurs (posterior-mean averaging) or misplaces modes.
+    """
+    x = samples.double()
+    n = torch.distributions.Normal(0.0, 1.0)
+    u = (den.w1 * n.cdf((x - den.m1) / den.s1)
+         + (1 - den.w1) * n.cdf((x - den.m2) / den.s2)).flatten()
+    u, _ = torch.sort(u)
+    grid = (torch.arange(u.numel(), dtype=torch.float64) + 0.5) / u.numel()
+    return float((u - grid).abs().mean())
+
+
 class ChainModel(DirectModel):
     """A DirectModel whose model_sampling is reachable the way ComfyUI's
     samplers reach it: model.inner_model.inner_model.model_sampling."""
@@ -146,10 +184,14 @@ def make_model_sampling(flow: bool, shift: float = 3.0):
 
 
 class FakeBaseModel:
-    def __init__(self, model_sampling, latent_format, unet_config):
+    def __init__(self, model_sampling, latent_format, unet_config, model_class=None):
         self.model_sampling = model_sampling
         self.latent_format = latent_format
-        self.model_config = SimpleNamespace(unet_config=unet_config)
+        if model_class:
+            # The DDRK nodes read ComfyUI's supported_models class name.
+            self.model_config = type(model_class, (), {"unet_config": unet_config})()
+        else:
+            self.model_config = SimpleNamespace(unet_config=unet_config)
 
     def process_latent_in(self, x):
         return x
@@ -168,7 +210,7 @@ class FakePatcher:
     """Just enough of comfy.model_patcher.ModelPatcher for the DDRK nodes."""
 
     def __init__(self, flow: bool, shape, seed: int = 0, shift: float = 3.0,
-                 image_model=None):
+                 image_model=None, model_class=None):
         self.flow = flow
         self.den = MixtureDenoiser(shape, flow, seed=seed)
         ms = make_model_sampling(flow, shift)
@@ -180,7 +222,7 @@ class FakePatcher:
         fmt.latent_dimensions = len(shape) - 2
         unet = {"image_model": image_model} if image_model else (
             {} if flow else {"context_dim": 768})
-        self.model = FakeBaseModel(ms, fmt, unet)
+        self.model = FakeBaseModel(ms, fmt, unet, model_class)
         self.load_device = torch.device("cpu")
         self.model_options = {"transformer_options": {}}
         self.calls = 0
