@@ -2805,6 +2805,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DDRKOmegaLiteKSamplerNode": "DDRK Omega Lite",
     "DDRKOmegaSmartConfigNode": "DDRK Omega Smart Config",
 }
-
-    "DDRKOmegaSmartConfigNode": "DDRK Omega Smart Config",
-}
